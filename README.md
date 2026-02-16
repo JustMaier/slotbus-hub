@@ -189,9 +189,4 @@ slotbus-hub inherits platform support from the slotbus library:
 
 ## License
 
-Licensed under either of
-
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT License](LICENSE-MIT)
-
-at your option.
+Licensed under the [MIT License](LICENSE-MIT).
