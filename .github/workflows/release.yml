@@ -45,11 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Clone slotbus dependency
-        uses: actions/checkout@v4
-        with:
-          repository: JustMaier/slotbus
-          path: ../slotbus
-          token: ${{ secrets.SLOTBUS_PAT }}
+        run: git clone --depth 1 https://x-access-token:${{ secrets.SLOTBUS_PAT }}@github.com/JustMaier/slotbus.git ../slotbus
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
