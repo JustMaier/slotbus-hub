@@ -22,18 +22,26 @@ jobs:
             runner: windows-latest
             artifact: slotbus-hub-x86_64-pc-windows-msvc.exe
             bin: slotbus-hub.exe
+            ffi_lib: slotbus_ffi.dll
+            ffi_artifact: slotbus_ffi-x86_64-pc-windows-msvc.dll
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             artifact: slotbus-hub-x86_64-unknown-linux-gnu
             bin: slotbus-hub
+            ffi_lib: libslotbus_ffi.so
+            ffi_artifact: slotbus_ffi-x86_64-unknown-linux-gnu.so
           - target: x86_64-apple-darwin
             runner: macos-13
             artifact: slotbus-hub-x86_64-apple-darwin
             bin: slotbus-hub
+            ffi_lib: libslotbus_ffi.dylib
+            ffi_artifact: slotbus_ffi-x86_64-apple-darwin.dylib
           - target: aarch64-apple-darwin
             runner: macos-latest
             artifact: slotbus-hub-aarch64-apple-darwin
             bin: slotbus-hub
+            ffi_lib: libslotbus_ffi.dylib
+            ffi_artifact: slotbus_ffi-aarch64-apple-darwin.dylib
     steps:
       - uses: actions/checkout@v4
       - name: Clone slotbus dependency
@@ -48,17 +56,29 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
+      - name: Build hub
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename binary
+      - name: Build FFI
+        run: cargo build -p slotbus-ffi --release --target ${{ matrix.target }}
+
+      - name: Rename hub binary
         shell: bash
         run: cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.artifact }}
+
+      - name: Rename FFI library
+        shell: bash
+        run: cp target/${{ matrix.target }}/release/${{ matrix.ffi_lib }} ${{ matrix.ffi_artifact }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.ffi_artifact }}
+          path: ${{ matrix.ffi_artifact }}
 
   release:
     name: GitHub Release

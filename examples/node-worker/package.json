@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "slotbus": "file:../../sdks/node"
+  }
+}

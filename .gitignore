@@ -4,3 +4,12 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+
+# Node
+node_modules/

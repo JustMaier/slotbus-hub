@@ -1,0 +1,10 @@
+[package]
+name = "slotbus-example-worker"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+slotbus = { path = "../../../slotbus/slotbus" }
+serde_json = "1"
+ureq = "2"

@@ -1,0 +1,12 @@
+{
+  "name": "slotbus",
+  "version": "0.1.0",
+  "description": "Node.js SDK for slotbus shared-memory IPC",
+  "main": "index.js",
+  "license": "MIT OR Apache-2.0",
+  "author": "Justin Zipperle",
+  "repository": "https://github.com/jzipperle/slotbus-hub",
+  "keywords": ["ipc", "shared-memory", "ffi"],
+  "engines": { "node": ">=18" },
+  "dependencies": { "koffi": "^2" }
+}

@@ -1,10 +1,21 @@
-[package]
-name = "slotbus-hub"
+[workspace]
+members = [".", "slotbus-ffi", "examples/rust-worker"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Justin Zipperle"]
 license = "MIT OR Apache-2.0"
+
+[package]
+name = "slotbus-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
 repository = "https://github.com/jzipperle/slotbus-hub"
 homepage = "https://github.com/jzipperle/slotbus-hub"
 description = "HTTP-to-SHM router. Workers register routes, clients send HTTP — slotbus-hub dispatches via shared memory with sub-millisecond round trips."

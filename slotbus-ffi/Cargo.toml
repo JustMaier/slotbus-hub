@@ -1,0 +1,19 @@
+[package]
+name = "slotbus-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "C FFI bindings for the slotbus shared-memory IPC library"
+categories = ["api-bindings", "external-ffi-bindings"]
+keywords = ["ffi", "ipc", "shared-memory", "c-api"]
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+slotbus = { path = "../../slotbus/slotbus" }
+ureq = "2"
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
