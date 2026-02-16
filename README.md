@@ -2,10 +2,8 @@
 
 **HTTP-to-SHM router for [slotbus](https://github.com/JustMaier/slotbus) workers.**
 
-[![Crates.io](https://img.shields.io/crates/v/slotbus-hub.svg)](https://crates.io/crates/slotbus-hub)
-[![docs.rs](https://img.shields.io/docsrs/slotbus-hub)](https://docs.rs/slotbus-hub)
 [![CI](https://github.com/JustMaier/slotbus-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/JustMaier/slotbus-hub/actions/workflows/ci.yml)
-[![License](https://img.shields.io/crates/l/slotbus-hub.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 
 Workers register routes via HTTP. Clients send normal HTTP requests. The hub dispatches them through shared memory with sub-millisecond round trips and returns the response. Multiple workers behind a single port, no HTTP overhead on the hot path.
 
