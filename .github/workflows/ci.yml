@@ -26,7 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt -p slotbus-hub -p slotbus-ffi -p rust-worker --check
+      - run: cargo fmt -p slotbus-hub -p slotbus-ffi -p slotbus-example-worker --check
 
   clippy:
     name: Clippy (${{ matrix.os }})
@@ -174,7 +174,7 @@ jobs:
         working-directory: sdks/python
         run: |
           if [ -f slotbus/_native.py ]; then
-            python -c "from slotbus._native import lib; print(lib.slotbus_version())"
+            python -c "from slotbus._native import slotbus_version; print(slotbus_version())"
           else
             echo "Python SDK not yet implemented — skipping binding test"
           fi
@@ -228,7 +228,7 @@ jobs:
         working-directory: sdks/node
         run: |
           if [ -f lib/native.js ]; then
-            node -e "const { native } = require('./lib/native'); console.log(native.slotbus_version())"
+            node -e "const { slotbus_version } = require('./lib/native'); console.log(slotbus_version())"
           else
             echo "Node SDK not yet implemented — skipping binding test"
           fi
