@@ -47,8 +47,9 @@ jobs:
       - name: Clone slotbus dependency
         uses: actions/checkout@v4
         with:
-          repository: jzipperle/slotbus
+          repository: JustMaier/slotbus
           path: ../slotbus
+          token: ${{ secrets.SLOTBUS_PAT }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

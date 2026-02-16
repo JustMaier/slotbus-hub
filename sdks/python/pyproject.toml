@@ -17,4 +17,4 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/jzipperle/slotbus-hub"
+Repository = "https://github.com/JustMaier/slotbus-hub"

@@ -1,10 +1,10 @@
 # slotbus-hub
 
-**HTTP-to-SHM router for [slotbus](https://github.com/jzipperle/slotbus) workers.**
+**HTTP-to-SHM router for [slotbus](https://github.com/JustMaier/slotbus) workers.**
 
 [![Crates.io](https://img.shields.io/crates/v/slotbus-hub.svg)](https://crates.io/crates/slotbus-hub)
 [![docs.rs](https://img.shields.io/docsrs/slotbus-hub)](https://docs.rs/slotbus-hub)
-[![CI](https://github.com/jzipperle/slotbus-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/jzipperle/slotbus-hub/actions/workflows/ci.yml)
+[![CI](https://github.com/JustMaier/slotbus-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/JustMaier/slotbus-hub/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/slotbus-hub.svg)](LICENSE-MIT)
 
 Workers register routes via HTTP. Clients send normal HTTP requests. The hub dispatches them through shared memory with sub-millisecond round trips and returns the response. Multiple workers behind a single port, no HTTP overhead on the hot path.
@@ -71,7 +71,7 @@ Logging is controlled by the `RUST_LOG` environment variable (default: `info`).
 5. **Worker** claims the slot, processes the request, writes the response back to shared memory.
 6. **Worker** signals the hub. The hub reads the response and returns it to the client as a normal HTTP response.
 
-The entire SHM round trip takes 0.1--0.8 ms. See the [slotbus](https://github.com/jzipperle/slotbus) library for details on the shared memory transport, slot state machine, and overflow handling.
+The entire SHM round trip takes 0.1--0.8 ms. See the [slotbus](https://github.com/JustMaier/slotbus) library for details on the shared memory transport, slot state machine, and overflow handling.
 
 ## Worker Registration
 
@@ -164,14 +164,14 @@ curl http://localhost:3200/health
 
 ## Building Workers
 
-The hub is just the router. To build a worker that connects to it, use the [slotbus](https://github.com/jzipperle/slotbus) library crate:
+The hub is just the router. To build a worker that connects to it, use the [slotbus](https://github.com/JustMaier/slotbus) library crate:
 
 ```toml
 [dependencies]
 slotbus = "0.1"
 ```
 
-A minimal worker: register routes with the hub via HTTP, open the SHM region using the returned `shm_name`, and start the receive loop. See the [slotbus README](https://github.com/jzipperle/slotbus#worker-side--connect-and-handle-requests) for the worker-side API.
+A minimal worker: register routes with the hub via HTTP, open the SHM region using the returned `shm_name`, and start the receive loop. See the [slotbus README](https://github.com/JustMaier/slotbus#worker-side--connect-and-handle-requests) for the worker-side API.
 
 ## Platform Support
 
