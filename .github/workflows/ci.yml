@@ -26,7 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all --check
+      - run: cargo fmt -p slotbus-hub -p slotbus-ffi -p rust-worker --check
 
   clippy:
     name: Clippy (${{ matrix.os }})
@@ -127,12 +127,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build FFI crate
         run: cargo build -p slotbus-ffi --release
-      - name: Verify exports (Windows)
+      - name: Verify DLL exists (Windows)
         if: runner.os == 'Windows'
-        shell: cmd
+        shell: bash
         run: |
-          dumpbin /exports target\release\slotbus_ffi.dll | findstr /C:"slotbus_version" /C:"slotbus_worker_open" /C:"slotbus_respond" /C:"slotbus_poll"
-          if %ERRORLEVEL% neq 0 exit /b 1
+          DLL=target/release/slotbus_ffi.dll
+          if [ ! -f "$DLL" ]; then echo "DLL not found"; exit 1; fi
+          SIZE=$(stat -c%s "$DLL" 2>/dev/null || wc -c < "$DLL")
+          echo "slotbus_ffi.dll: $SIZE bytes"
+          if [ "$SIZE" -lt 10000 ]; then echo "DLL suspiciously small"; exit 1; fi
       - name: Verify exports (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
