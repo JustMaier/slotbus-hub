@@ -1,11 +1,24 @@
 # slotbus-hub
 
-**HTTP-to-SHM router for [slotbus](https://github.com/JustMaier/slotbus) workers.**
+**HTTP-to-shared-memory router for same-machine microservices.** Workers register routes via HTTP. Clients send normal HTTP requests. The hub dispatches them through shared memory with sub-millisecond round trips. Multiple workers behind a single port, zero HTTP overhead on the hot path.
 
 [![CI](https://github.com/JustMaier/slotbus-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/JustMaier/slotbus-hub/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/slotbus-hub.svg)](https://crates.io/crates/slotbus-hub)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 
-Workers register routes via HTTP. Clients send normal HTTP requests. The hub dispatches them through shared memory with sub-millisecond round trips and returns the response. Multiple workers behind a single port, no HTTP overhead on the hot path.
+Built on [slotbus](https://github.com/JustMaier/slotbus), a lock-free shared memory IPC library for Rust.
+
+## Why slotbus-hub?
+
+You have services running on the same machine that communicate over HTTP. Each request pays for TCP handshakes, socket copies, HTTP parsing, and JSON serialization — overhead that adds 5-20ms per round trip to what should be a local function call.
+
+slotbus-hub replaces that hot path with shared memory. From the outside, it looks like a normal HTTP server. On the inside, requests are dispatched to workers through memory-mapped slots with **0.1-0.8ms round trips** — 10-50x faster than localhost HTTP.
+
+- **Drop-in HTTP gateway** — clients don't know they're using shared memory
+- **Dynamic route registration** — workers register routes at startup, no config files
+- **Multiple workers** — route different paths to different worker processes
+- **SSE event stream** — workers push events, clients subscribe via `/events`
+- **Sub-millisecond dispatch** — the entire SHM round trip takes 0.1-0.8ms
 
 ## Installation
 
@@ -13,7 +26,7 @@ Workers register routes via HTTP. Clients send normal HTTP requests. The hub dis
 cargo install slotbus-hub
 ```
 
-## Usage
+## Quick Start
 
 ```bash
 # Start the hub on the default port (3200)
@@ -69,7 +82,7 @@ Logging is controlled by the `RUST_LOG` environment variable (default: `info`).
 5. **Worker** claims the slot, processes the request, writes the response back to shared memory.
 6. **Worker** signals the hub. The hub reads the response and returns it to the client as a normal HTTP response.
 
-The entire SHM round trip takes 0.1--0.8 ms. See the [slotbus](https://github.com/JustMaier/slotbus) library for details on the shared memory transport, slot state machine, and overflow handling.
+The entire SHM round trip takes 0.1-0.8 ms. See the [slotbus](https://github.com/JustMaier/slotbus) library for details on the shared memory transport, slot state machine, and overflow handling.
 
 ## Worker Registration
 
