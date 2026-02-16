@@ -1,0 +1,30 @@
+[package]
+name = "slotbus-hub"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Justin Zipperle"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jzipperle/slotbus-hub"
+homepage = "https://github.com/jzipperle/slotbus-hub"
+description = "HTTP-to-SHM router. Workers register routes, clients send HTTP — slotbus-hub dispatches via shared memory with sub-millisecond round trips."
+categories = ["network-programming", "command-line-utilities"]
+keywords = ["ipc", "shared-memory", "router", "http", "microservices"]
+readme = "README.md"
+
+[dependencies]
+# For local development, use path dependency:
+slotbus = { path = "../slotbus/slotbus" }
+# For publishing, switch to: slotbus = "0.1"
+
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
