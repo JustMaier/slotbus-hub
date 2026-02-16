@@ -36,8 +36,7 @@ fn main() {
     resp_reader
         .read_to_string(&mut resp_body)
         .expect("failed to read response");
-    let resp: serde_json::Value =
-        serde_json::from_str(&resp_body).expect("invalid JSON");
+    let resp: serde_json::Value = serde_json::from_str(&resp_body).expect("invalid JSON");
 
     let shm_name = resp["shm_name"].as_str().expect("no shm_name in response");
     println!("Registered as '{worker_name}', SHM region: {shm_name}");

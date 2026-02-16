@@ -36,9 +36,7 @@ pub async fn unified_sse(
     let stream = BroadcastStream::new(rx).filter_map(|result| match result {
         Ok(hub_event) => {
             let data = serde_json::to_string(&hub_event).unwrap_or_default();
-            Some(Ok(Event::default()
-                .event(&hub_event.event_type)
-                .data(data)))
+            Some(Ok(Event::default().event(&hub_event.event_type).data(data)))
         }
         Err(_) => None,
     });

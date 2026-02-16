@@ -131,11 +131,7 @@ async fn register_worker(
     {
         let mut table = state.route_table.write().await;
         for route in &req.routes {
-            table.push((
-                route.method.clone(),
-                route.path.clone(),
-                worker_id.clone(),
-            ));
+            table.push((route.method.clone(), route.path.clone(), worker_id.clone()));
         }
     }
 
@@ -189,10 +185,7 @@ async fn health(State(state): State<Arc<HubState>>) -> impl IntoResponse {
 
 // ---- Fallback: proxy handler -------------------------------------------------
 
-async fn proxy_handler(
-    State(state): State<Arc<HubState>>,
-    request: Request,
-) -> impl IntoResponse {
+async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> impl IntoResponse {
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(|q| q.to_string());
@@ -220,9 +213,9 @@ async fn proxy_handler(
 
     // Find matching route
     let route_table = state.route_table.read().await;
-    let matched = route_table.iter().find(|(m, pattern, _)| {
-        m == &method && match_route(pattern, &path).is_some()
-    });
+    let matched = route_table
+        .iter()
+        .find(|(m, pattern, _)| m == &method && match_route(pattern, &path).is_some());
 
     let (route_pattern, worker_id) = match matched {
         Some((_, pattern, wid)) => (pattern.clone(), wid.clone()),
@@ -266,11 +259,7 @@ async fn proxy_handler(
     let rx = match bus.dispatch(&req_id, &method, &meta, &body_bytes) {
         Ok(rx) => rx,
         Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("SHM dispatch failed: {e}"),
-            )
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, format!("SHM dispatch failed: {e}")).into_response();
         }
     };
 

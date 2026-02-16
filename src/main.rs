@@ -88,9 +88,7 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("ctrl-c handler");
+        tokio::signal::ctrl_c().await.expect("ctrl-c handler");
         tracing::info!("Received Ctrl+C");
     }
 }

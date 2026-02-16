@@ -128,10 +128,7 @@ pub unsafe extern "C" fn slotbus_worker_open(
         "slotbus"
     };
 
-    let config = SlotBusConfig::builder()
-        .name(name)
-        .prefix(prefix)
-        .build();
+    let config = SlotBusConfig::builder().name(name).prefix(prefix).build();
 
     let mut region = match ShmRegion::open(&config.region_name()) {
         Ok(r) => r,
@@ -459,10 +456,7 @@ pub unsafe extern "C" fn slotbus_poll_respond(
 
 /// Drop a polled request without responding (sends 500 automatically).
 #[no_mangle]
-pub unsafe extern "C" fn slotbus_poll_drop(
-    worker: *mut FfiWorker,
-    request: *mut FfiRequest,
-) {
+pub unsafe extern "C" fn slotbus_poll_drop(worker: *mut FfiWorker, request: *mut FfiRequest) {
     if worker.is_null() || request.is_null() {
         return;
     }
@@ -534,9 +528,7 @@ pub unsafe extern "C" fn slotbus_request_path(req: *const FfiRequest) -> *const 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn slotbus_request_route_pattern(
-    req: *const FfiRequest,
-) -> *const c_char {
+pub unsafe extern "C" fn slotbus_request_route_pattern(req: *const FfiRequest) -> *const c_char {
     if req.is_null() {
         return empty_cstr();
     }
@@ -1017,21 +1009,30 @@ unsafe fn read_and_decode(
     slot_index: usize,
     config: &SlotBusConfig,
 ) -> Option<FfiRequest> {
-    let (req_id, method_u8, meta, body) =
-        region::read_request(region, slot_index, config).ok()?;
+    let (req_id, method_u8, meta, body) = region::read_request(region, slot_index, config).ok()?;
 
     let method_str = u8_to_method(method_u8);
 
     let headers: Vec<(CString, CString)> = meta
         .headers
         .iter()
-        .filter_map(|(k, v)| Some((CString::new(k.as_str()).ok()?, CString::new(v.as_str()).ok()?)))
+        .filter_map(|(k, v)| {
+            Some((
+                CString::new(k.as_str()).ok()?,
+                CString::new(v.as_str()).ok()?,
+            ))
+        })
         .collect();
 
     let path_params: Vec<(CString, CString)> = meta
         .path_params
         .iter()
-        .filter_map(|(k, v)| Some((CString::new(k.as_str()).ok()?, CString::new(v.as_str()).ok()?)))
+        .filter_map(|(k, v)| {
+            Some((
+                CString::new(k.as_str()).ok()?,
+                CString::new(v.as_str()).ok()?,
+            ))
+        })
         .collect();
 
     Some(FfiRequest {
@@ -1072,10 +1073,7 @@ fn send_response_to_slot(
         .map_err(|e| format!("write_response error: {e}"))?;
 
     if let Some(ovf) = overflow {
-        overflow_regions
-            .lock()
-            .unwrap()
-            .insert(slot_index, ovf);
+        overflow_regions.lock().unwrap().insert(slot_index, ovf);
     }
 
     rsp_event.signal();
