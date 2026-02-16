@@ -13,3 +13,6 @@ dist/
 
 # Node
 node_modules/
+
+# CI dependency clone
+.slotbus/

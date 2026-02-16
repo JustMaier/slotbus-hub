@@ -45,7 +45,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Clone slotbus dependency
-        run: git clone --depth 1 https://x-access-token:${{ secrets.SLOTBUS_PAT }}@github.com/JustMaier/slotbus.git ../slotbus
+        uses: actions/checkout@v4
+        with:
+          repository: JustMaier/slotbus
+          path: .slotbus
+          token: ${{ secrets.SLOTBUS_PAT }}
+      - name: Link slotbus to expected path (Unix)
+        if: runner.os != 'Windows'
+        run: ln -s "$PWD/.slotbus" ../slotbus
+      - name: Link slotbus to expected path (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: mklink /J "%CD%\..\slotbus" "%CD%\.slotbus"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
