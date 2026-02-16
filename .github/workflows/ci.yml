@@ -42,8 +42,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets
 
   test:
-    name: Test (Windows)
-    runs-on: windows-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Clone slotbus dependency
@@ -55,25 +59,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
-
-  compile:
-    name: Compile check (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Clone slotbus dependency
-        uses: actions/checkout@v4
-        with:
-          repository: JustMaier/slotbus
-          path: ../slotbus
-          token: ${{ secrets.SLOTBUS_PAT }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
 
   doc:
     name: Documentation
@@ -93,8 +78,12 @@ jobs:
       - run: cargo doc --workspace --no-deps
 
   ffi-build:
-    name: FFI Build (Windows)
-    runs-on: windows-latest
+    name: FFI Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Clone slotbus dependency
@@ -107,11 +96,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build FFI crate
         run: cargo build -p slotbus-ffi --release
-      - name: Verify DLL exports
+      - name: Verify exports (Windows)
+        if: runner.os == 'Windows'
         shell: cmd
         run: |
           dumpbin /exports target\release\slotbus_ffi.dll | findstr /C:"slotbus_version" /C:"slotbus_worker_open" /C:"slotbus_respond" /C:"slotbus_poll"
           if %ERRORLEVEL% neq 0 exit /b 1
+      - name: Verify exports (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          LIB=$(find target/release -maxdepth 1 -name 'libslotbus_ffi.so' -o -name 'libslotbus_ffi.dylib' | head -1)
+          if [ -z "$LIB" ]; then echo "FFI library not found"; exit 1; fi
+          nm -D "$LIB" 2>/dev/null || nm "$LIB" | grep -c "slotbus_" | xargs -I{} test {} -gt 0
 
   python-sdk-test:
     name: Python SDK (Windows)

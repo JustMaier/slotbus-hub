@@ -180,8 +180,8 @@ slotbus-hub inherits platform support from the slotbus library:
 | Platform | Status |
 |---|---|
 | **Windows** | Supported |
-| **Linux** | Planned |
-| **macOS** | Planned |
+| **Linux** | Supported |
+| **macOS** | Supported |
 
 ## Minimum Supported Rust Version
 
