@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository = "https://github.com/JustMaier/slotbus-hub"
 description = "C FFI bindings for the slotbus shared-memory IPC library"
 categories = ["api-bindings", "external-ffi-bindings"]
 keywords = ["ffi", "ipc", "shared-memory", "c-api"]
@@ -13,7 +14,7 @@ keywords = ["ffi", "ipc", "shared-memory", "c-api"]
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-slotbus = { path = "../../slotbus/slotbus" }
+slotbus = "0.1"
 ureq = "2"
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
