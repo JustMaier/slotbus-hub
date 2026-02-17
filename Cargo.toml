@@ -24,7 +24,9 @@ keywords = ["ipc", "shared-memory", "router", "http", "microservices"]
 readme = "README.md"
 
 [dependencies]
-slotbus = "0.1"
+# For local development, use path dependency:
+slotbus = { path = "../slotbus/slotbus" }
+# For publishing, switch to: slotbus = "0.1"
 
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
