@@ -6,7 +6,6 @@
 
 mod events;
 mod router;
-mod types;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;

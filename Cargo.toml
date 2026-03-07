@@ -18,7 +18,7 @@ authors.workspace = true
 license.workspace = true
 repository = "https://github.com/JustMaier/slotbus-hub"
 homepage = "https://github.com/JustMaier/slotbus-hub"
-description = "HTTP-to-SHM router. Workers register routes, clients send HTTP — slotbus-hub dispatches via shared memory with sub-millisecond round trips."
+description = "HTTP-to-SHM router with worker SDK. Workers register routes, clients send HTTP — slotbus-hub dispatches via shared memory with sub-millisecond round trips."
 categories = ["network-programming", "command-line-utilities"]
 keywords = ["ipc", "shared-memory", "router", "http", "microservices"]
 readme = "README.md"
@@ -28,10 +28,13 @@ readme = "README.md"
 slotbus = { path = "../slotbus/slotbus" }
 # For publishing, switch to: slotbus = "0.1"
 
-axum = "0.8"
-tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# Hub binary dependencies
+axum = "0.8"
 postcard = { version = "1", features = ["alloc"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

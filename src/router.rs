@@ -16,7 +16,7 @@ use slotbus::types::RequestMeta;
 use slotbus::{SlotBus, SlotBusConfig};
 
 use crate::events;
-use crate::types::*;
+use slotbus_hub::types::*;
 
 // ---- Configuration -----------------------------------------------------------
 

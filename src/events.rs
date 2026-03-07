@@ -11,7 +11,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
 use crate::router::HubState;
-use crate::types::{HubEvent, WorkerEvent};
+use slotbus_hub::types::{HubEvent, WorkerEvent};
 
 /// `POST /internal/emit` — worker pushes an event for broadcast.
 pub async fn emit_event(
