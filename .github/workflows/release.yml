@@ -43,9 +43,9 @@ jobs:
             ffi_lib: libslotbus_ffi.dylib
             ffi_artifact: slotbus_ffi-aarch64-apple-darwin.dylib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Clone slotbus dependency
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: JustMaier/slotbus
           path: .slotbus
@@ -78,12 +78,12 @@ jobs:
         shell: bash
         run: cp target/${{ matrix.target }}/release/${{ matrix.ffi_lib }} ${{ matrix.ffi_artifact }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.ffi_artifact }}
           path: ${{ matrix.ffi_artifact }}
@@ -93,8 +93,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -110,7 +110,7 @@ jobs:
   #   needs: build
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #     - uses: dtolnay/rust-toolchain@stable
   #     # NOTE: Before publishing, switch Cargo.toml from path dep to: slotbus = "0.1"
   #     - run: cargo publish
