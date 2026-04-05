@@ -97,6 +97,7 @@ struct RouteEntry<S> {
     method: String,
     path: String,
     handler: BoxHandler<S>,
+    sse: bool,
 }
 
 // ---- HubEmitter --------------------------------------------------------------
@@ -124,6 +125,66 @@ impl HubEmitter {
             .send()
             .await
             .map_err(|e| format!("Failed to emit event: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Push an event to a specific hub-managed SSE connection by exact path.
+    pub async fn sse_push(&self, path: &str, event_type: &str, data: &str) -> Result<(), String> {
+        let req = SsePushRequest {
+            path: Some(path.to_string()),
+            pattern: None,
+            params: None,
+            event_type: event_type.to_string(),
+            data: data.to_string(),
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}/internal/sse-push", self.hub_url))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to push SSE event: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("SSE push failed ({status}): {body}"));
+        }
+
+        Ok(())
+    }
+
+    /// Push an event to a hub-managed SSE connection by pattern + params.
+    pub async fn sse_push_by_pattern(
+        &self,
+        pattern: &str,
+        params: HashMap<String, String>,
+        event_type: &str,
+        data: &str,
+    ) -> Result<(), String> {
+        let req = SsePushRequest {
+            path: None,
+            pattern: Some(pattern.to_string()),
+            params: Some(params),
+            event_type: event_type.to_string(),
+            data: data.to_string(),
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}/internal/sse-push", self.hub_url))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to push SSE event: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("SSE push failed ({status}): {body}"));
+        }
 
         Ok(())
     }
@@ -173,6 +234,34 @@ impl<S: Send + Sync + 'static> HubWorker<S> {
             method: method.to_string(),
             path: path.to_string(),
             handler: boxed,
+            sse: false,
+        });
+        self
+    }
+
+    /// Register an SSE route. The hub manages the SSE connection and sends
+    /// lifecycle events (`SSE_CONNECT`/`SSE_DISCONNECT`) as POST requests to
+    /// this handler. The handler receives a JSON body with `sse_lifecycle`
+    /// ("connect"/"disconnect") and `params` fields.
+    pub fn sse_route<F, Fut>(mut self, path: &str, handler: F) -> Self
+    where
+        F: Fn(Arc<S>, HashMap<String, String>, Option<String>, Vec<u8>) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = HandlerResponse> + Send + 'static,
+    {
+        let boxed: BoxHandler<S> = Box::new(move |state, params, query, body| {
+            Box::pin(handler(state, params, query, body))
+        });
+        // SSE routes register as GET (the client-facing method) but the hub
+        // sends lifecycle events as POST via SHM. The worker matches on
+        // method=POST + route_pattern.
+        self.routes.push(RouteEntry {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            handler: boxed,
+            sse: true,
         });
         self
     }
@@ -201,6 +290,7 @@ impl<S: Send + Sync + 'static> HubWorker<S> {
             .map(|r| RouteRegistration {
                 method: r.method.clone(),
                 path: r.path.clone(),
+                sse: r.sse,
             })
             .collect();
 
