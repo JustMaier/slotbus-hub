@@ -870,3 +870,206 @@ pub fn resolve_sse_path(
     }
     None
 }
+
+// ---- Tests -------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal HubState with empty worker / route tables. Tests that
+    /// only exercise SSE cleanup never hit the SHM dispatch path — when our
+    /// cleanup calls `dispatch_sse_lifecycle` with a worker_id that isn't in
+    /// `state.workers`, `dispatch_sse_lifecycle` logs a warning and returns
+    /// without trying to touch SHM. That's exactly what we want here.
+    fn make_state() -> Arc<HubState> {
+        let (event_tx, _rx) = broadcast::channel::<HubEvent>(16);
+        Arc::new(HubState {
+            workers: RwLock::new(HashMap::new()),
+            route_table: RwLock::new(Vec::new()),
+            event_tx,
+            sse_connections: RwLock::new(HashMap::new()),
+            config: HubConfig {
+                timeout_secs: 30,
+                num_slots: 32,
+                region_size: 1024 * 1024,
+                instrumentation: false,
+                // 0 disables the background sweeper — tests invoke sweep_once
+                // directly to keep behavior deterministic.
+                sse_sweep_interval_ms: 0,
+            },
+        })
+    }
+
+    /// Insert a dummy SSE connection and return the receiver so the test can
+    /// decide when to drop it.
+    async fn insert_conn(
+        state: &HubState,
+        path: &str,
+        connection_id: &str,
+    ) -> mpsc::Receiver<SseEvent> {
+        let (tx, rx) = mpsc::channel::<SseEvent>(16);
+        let mut sse = state.sse_connections.write().await;
+        sse.insert(
+            path.to_string(),
+            SseConnectionInfo {
+                connection_id: connection_id.to_string(),
+                worker_id: "test-worker".to_string(),
+                path_pattern: path.to_string(),
+                params: HashMap::new(),
+                sender: tx,
+                connected_at: "0Z".to_string(),
+            },
+        );
+        rx
+    }
+
+    async fn assert_present(state: &HubState, path: &str) {
+        let sse = state.sse_connections.read().await;
+        assert!(
+            sse.contains_key(path),
+            "expected entry present for {path}, but was missing"
+        );
+    }
+
+    async fn assert_missing(state: &HubState, path: &str) {
+        let sse = state.sse_connections.read().await;
+        assert!(
+            !sse.contains_key(path),
+            "expected entry absent for {path}, but it was present"
+        );
+    }
+
+    /// Wait a short, generous interval for any cleanup tasks spawned by
+    /// `sweep_once` to complete. We can't deterministically await spawned
+    /// tasks, so this sleep is the pragmatic substitute; 200ms is plenty
+    /// for a hash-map mutation under light load.
+    async fn drain_spawned_cleanup() {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_with_matching_connection_id_removes_entry() {
+        let state = make_state();
+        let path = "/agent/events/session-a";
+        let _rx = insert_conn(&state, path, "conn-1").await;
+
+        cleanup_sse_connection(&state, path, "test", "conn-1").await;
+
+        assert_missing(&state, path).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_with_mismatched_connection_id_preserves_entry() {
+        // The race this protects against:
+        //   1. Client A is registered with connection_id "A".
+        //   2. Client A's stream dies; somebody queues cleanup with id "A".
+        //   3. Before the cleanup runs, Client B connects on the SAME path
+        //      and replaces the map entry (connection_id "B").
+        //   4. Cleanup runs with id "A" — we must NOT evict Client B.
+        let state = make_state();
+        let path = "/agent/events/session-collision";
+
+        // Client B is the current holder of this path.
+        let _rx = insert_conn(&state, path, "conn-B").await;
+
+        // Stale cleanup request from Client A.
+        cleanup_sse_connection(&state, path, "test", "conn-A").await;
+
+        // Client B's entry is still there.
+        assert_present(&state, path).await;
+        let sse = state.sse_connections.read().await;
+        assert_eq!(sse.get(path).unwrap().connection_id, "conn-B");
+    }
+
+    #[tokio::test]
+    async fn cleanup_on_missing_path_is_noop() {
+        let state = make_state();
+        // Never inserted — cleanup must not panic or otherwise misbehave.
+        cleanup_sse_connection(&state, "/nothing/here", "test", "conn-X").await;
+        let sse = state.sse_connections.read().await;
+        assert!(sse.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_closed_channel() {
+        let state = make_state();
+        let path = "/agent/events/dead-client";
+
+        // Insert a connection and immediately drop the receiver, simulating
+        // axum having torn down the stream after a keepalive write failed.
+        let rx = insert_conn(&state, path, "conn-dead").await;
+        drop(rx);
+
+        sweep_once(&state).await;
+        drain_spawned_cleanup().await;
+
+        assert_missing(&state, path).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_live_channel() {
+        let state = make_state();
+        let path = "/agent/events/live-client";
+
+        // Hold onto the receiver so the channel stays open.
+        let _rx = insert_conn(&state, path, "conn-live").await;
+
+        sweep_once(&state).await;
+        drain_spawned_cleanup().await;
+
+        assert_present(&state, path).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_ignores_full_buffer_as_alive() {
+        // A client whose receiver is still alive but whose buffer is full
+        // must not be treated as dead. We force that state by filling the
+        // 16-slot channel to capacity and then running a sweep. The
+        // TrySendError::Full branch should NOT push the path into `closed`,
+        // so the entry survives.
+        let state = make_state();
+        let path = "/agent/events/slow-client";
+        let _rx = insert_conn(&state, path, "conn-slow").await;
+
+        // Pre-fill the buffer. The sender was stashed in the map, so pull
+        // it out and flood it to the brim without draining.
+        {
+            let sse = state.sse_connections.read().await;
+            let sender = sse.get(path).unwrap().sender.clone();
+            for i in 0..16 {
+                sender
+                    .try_send(SseEvent {
+                        event_type: "filler".into(),
+                        data: format!("{i}"),
+                    })
+                    .expect("pre-fill should succeed");
+            }
+            // Next try_send from within sweep_once will hit Full.
+        }
+
+        sweep_once(&state).await;
+        drain_spawned_cleanup().await;
+
+        assert_present(&state, path).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_cleans_only_closed_entries() {
+        // Mixed state: one dead, one alive, one slow. Sweep must remove
+        // exactly the dead one.
+        let state = make_state();
+
+        let _alive_rx = insert_conn(&state, "/agent/events/alive", "conn-alive").await;
+        let dead_rx = insert_conn(&state, "/agent/events/dead", "conn-dead").await;
+        let _slow_rx = insert_conn(&state, "/agent/events/slow", "conn-slow").await;
+        drop(dead_rx);
+
+        sweep_once(&state).await;
+        drain_spawned_cleanup().await;
+
+        assert_present(&state, "/agent/events/alive").await;
+        assert_missing(&state, "/agent/events/dead").await;
+        assert_present(&state, "/agent/events/slow").await;
+    }
+}
