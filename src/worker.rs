@@ -280,98 +280,216 @@ impl<S: Send + Sync + 'static> HubWorker<S> {
         self.state.clone()
     }
 
-    /// Register with the hub, open the SHM region, and dispatch incoming
-    /// requests to handlers. Blocks forever (reconnects on SHM loss).
+    /// Register with the hub, open the SHM region, dispatch incoming
+    /// requests, and **auto-reconnect if the hub restarts.**
+    ///
+    /// The worker runs a health-check poll in parallel with the SHM receive
+    /// loop. If the hub becomes unreachable or no longer lists us as a
+    /// registered worker (strong signal the hub process was replaced), we
+    /// stop the current receive loop, drop the stale SHM handle, back off
+    /// briefly, and re-run the full register → open → dispatch cycle. The
+    /// route table and shared state are preserved across reconnects; only
+    /// the SHM region and the hub-assigned `worker_id` change.
+    ///
+    /// This returns `Ok(())` only if the outer caller explicitly stops the
+    /// tokio runtime. Under normal operation it loops forever.
     pub async fn run(self) -> Result<(), String> {
-        // ── Register ─────────────────────────────────────────────────────
-        let route_regs: Vec<RouteRegistration> = self
-            .routes
-            .iter()
-            .map(|r| RouteRegistration {
-                method: r.method.clone(),
-                path: r.path.clone(),
-                sse: r.sse,
-            })
-            .collect();
+        let Self {
+            hub_url,
+            name,
+            state,
+            routes,
+            client,
+        } = self;
+        let routes: Arc<Vec<RouteEntry<S>>> = Arc::new(routes);
 
-        let reg_req = RegisterRequest {
-            name: self.name.clone(),
-            routes: route_regs,
-        };
+        // Exponential backoff capped at 30s. The exponent is clamped at 5
+        // (so 1 → 2 → 4 → 8 → 16 → 30 → 30 …) to avoid absurdly long waits
+        // while still giving a struggling hub room to recover.
+        const MAX_BACKOFF_SECS: u64 = 30;
+        let mut attempt: u32 = 0;
 
-        let resp = self
-            .client
-            .post(format!("{}/internal/register", self.hub_url))
-            .json(&reg_req)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to register with hub: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Hub registration failed ({status}): {body}"));
-        }
-
-        let reg_resp: RegisterResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("Invalid registration response: {e}"))?;
-
-        eprintln!(
-            "[{}] Registered with hub (worker_id={}, shm={}, {} routes)",
-            self.name.to_uppercase(),
-            reg_resp.worker_id,
-            reg_resp.shm_name,
-            self.routes.len()
-        );
-
-        // ── Open SHM region + events ─────────────────────────────────────
-        let worker_config = SlotBusConfig::builder()
-            .name(&self.name)
-            .prefix("hub")
-            .build();
-
-        let transport = Arc::new(
-            SlotWorker::open(worker_config)
-                .map_err(|e| format!("Failed to open SHM: {e}"))?,
-        );
-
-        // ── Shared state for concurrent request handling ─────────────────
-        let routes: Arc<Vec<RouteEntry<S>>> = Arc::new(self.routes);
-        let state = self.state;
-        let name = self.name.clone();
-
-        let rt_handle = tokio::runtime::Handle::current();
-
-        // ── SHM receive loop (blocking thread) ───────────────────────────
-        let transport_clone = Arc::clone(&transport);
-        let handle = transport_clone.start_receive_loop(move |worker, slot_index, request| {
-            let routes = Arc::clone(&routes);
-            let state = Arc::clone(&state);
-            let worker_name = name.clone();
-            let worker = Arc::clone(&worker);
-
-            rt_handle.spawn(async move {
-                let response = dispatch_request(&worker_name, &routes, state, request).await;
-
-                if let Err(e) = worker.send_response(
-                    slot_index,
-                    response.status,
-                    response.body,
-                    &response.content_type,
-                    response.headers,
-                ) {
-                    eprintln!(
-                        "[{}] Failed to write response to slot {slot_index}: {e}",
-                        worker_name.to_uppercase()
-                    );
+        loop {
+            match run_once(&hub_url, &name, &client, &routes, &state).await {
+                Ok(()) => {
+                    // run_once only returns Ok on clean shutdown, which
+                    // currently isn't wired up. Propagate anyway so callers
+                    // that add shutdown support later see the clean exit.
+                    return Ok(());
                 }
-            });
-        });
-
-        handle.join().map_err(|_| "SHM receive thread panicked".to_string())
+                Err(e) => {
+                    let delay_secs = (1u64 << attempt.min(5)).min(MAX_BACKOFF_SECS);
+                    eprintln!(
+                        "[{}] Hub connection lost: {e}. Reconnecting in {delay_secs}s...",
+                        name.to_uppercase()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        }
     }
+}
+
+/// Poll interval for the hub health check watchdog.
+const HUB_HEALTH_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One full lifecycle: register with the hub, open the SHM region, run the
+/// receive loop, and block on a health-check watchdog. Returns `Err` with
+/// a human-readable reason when the hub goes away so the outer `run()` can
+/// back off and retry.
+async fn run_once<S: Send + Sync + 'static>(
+    hub_url: &str,
+    name: &str,
+    client: &reqwest::Client,
+    routes: &Arc<Vec<RouteEntry<S>>>,
+    state: &Arc<S>,
+) -> Result<(), String> {
+    // ── Register ─────────────────────────────────────────────────────────
+    let route_regs: Vec<RouteRegistration> = routes
+        .iter()
+        .map(|r| RouteRegistration {
+            method: r.method.clone(),
+            path: r.path.clone(),
+            sse: r.sse,
+        })
+        .collect();
+
+    let reg_req = RegisterRequest {
+        name: name.to_string(),
+        routes: route_regs,
+    };
+
+    let resp = client
+        .post(format!("{hub_url}/internal/register"))
+        .json(&reg_req)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to register with hub: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Hub registration failed ({status}): {body}"));
+    }
+
+    let reg_resp: RegisterResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Invalid registration response: {e}"))?;
+
+    let worker_id = reg_resp.worker_id.clone();
+    eprintln!(
+        "[{}] Registered with hub (worker_id={}, shm={}, {} routes)",
+        name.to_uppercase(),
+        worker_id,
+        reg_resp.shm_name,
+        routes.len()
+    );
+
+    // ── Open SHM region ──────────────────────────────────────────────────
+    let worker_config = SlotBusConfig::builder()
+        .name(name)
+        .prefix("hub")
+        .build();
+
+    let transport = Arc::new(
+        SlotWorker::open(worker_config)
+            .map_err(|e| format!("Failed to open SHM: {e}"))?,
+    );
+
+    // ── SHM receive loop (blocking thread) ───────────────────────────────
+    let rt_handle = tokio::runtime::Handle::current();
+    let transport_for_loop = Arc::clone(&transport);
+    let routes_for_loop = Arc::clone(routes);
+    let state_for_loop = Arc::clone(state);
+    let name_for_loop = name.to_string();
+
+    let receive_join = transport_for_loop.start_receive_loop(move |worker, slot_index, request| {
+        let routes = Arc::clone(&routes_for_loop);
+        let state = Arc::clone(&state_for_loop);
+        let worker_name = name_for_loop.clone();
+        let worker = Arc::clone(&worker);
+
+        rt_handle.spawn(async move {
+            let response = dispatch_request(&worker_name, &routes, state, request).await;
+
+            if let Err(e) = worker.send_response(
+                slot_index,
+                response.status,
+                response.body,
+                &response.content_type,
+                response.headers,
+            ) {
+                eprintln!(
+                    "[{}] Failed to write response to slot {slot_index}: {e}",
+                    worker_name.to_uppercase()
+                );
+            }
+        });
+    });
+
+    // ── Health watchdog ──────────────────────────────────────────────────
+    //
+    // Poll /health and check that our worker_id is still in the list. If
+    // the hub process restarts, it loses all worker records and our id
+    // disappears — that's the signal to drop this session and reconnect.
+    // A transient network error also triggers reconnect: it's cheap to
+    // spuriously re-register, and the hub's register handler tolerates
+    // replay of an existing worker by replacing the entry.
+    let health_url = format!("{hub_url}/health");
+    let reason = loop {
+        tokio::time::sleep(HUB_HEALTH_POLL).await;
+        match check_worker_registered(client, &health_url, &worker_id).await {
+            Ok(true) => continue,
+            Ok(false) => {
+                break format!("worker_id {worker_id} missing from /health (hub restarted?)")
+            }
+            Err(e) => break format!("health check error: {e}"),
+        }
+    };
+
+    // ── Clean up and signal caller to reconnect ──────────────────────────
+    transport.stop();
+    // Joining the receive thread is best-effort: it should exit promptly
+    // once `stop()` wakes the req_event, but we don't want to block forever
+    // if something is wedged.
+    let _ = receive_join.join();
+
+    Err(reason)
+}
+
+/// Hit the hub's `/health` endpoint and check whether the given worker_id
+/// is still in the active workers list.
+///
+/// Returns:
+///   - `Ok(true)`  — hub reachable and we're still registered
+///   - `Ok(false)` — hub reachable but our worker_id is gone (hub restarted
+///                   or something else kicked us out)
+///   - `Err(_)`    — hub unreachable or response is unparseable
+async fn check_worker_registered(
+    client: &reqwest::Client,
+    health_url: &str,
+    worker_id: &str,
+) -> Result<bool, String> {
+    let resp = client
+        .get(health_url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {health_url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("health returned status {}", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid health JSON: {e}"))?;
+    let Some(workers) = body.get("workers").and_then(|w| w.as_array()) else {
+        return Err("health response missing 'workers' array".to_string());
+    };
+    Ok(workers
+        .iter()
+        .any(|w| w.get("worker_id").and_then(|id| id.as_str()) == Some(worker_id)))
 }
 
 /// Dispatch a single request to the matching handler.
