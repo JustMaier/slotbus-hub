@@ -100,7 +100,12 @@ pub async fn sse_push(
         }
     };
 
-    // First try with a read lock (common path: connection exists and is healthy)
+    // First try with a read lock (common path: connection exists and is healthy).
+    // Capture the connection_id alongside the sender so that if try_send
+    // returns Closed, we can pass it through to cleanup_sse_connection and
+    // avoid evicting a replacement that took the same path between lookup
+    // and cleanup.
+    let connection_id: String;
     {
         let sse = state.sse_connections.read().await;
         let conn = match sse.get(&path) {
@@ -115,6 +120,7 @@ pub async fn sse_push(
                     .into_response();
             }
         };
+        connection_id = conn.connection_id.clone();
 
         match conn.sender.try_send(SseEvent {
             event_type: req.event_type.clone(),
@@ -132,17 +138,16 @@ pub async fn sse_push(
                     .into_response();
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                // Fall through to remove the stale entry with a write lock
+                // Fall through to cleanup via the shared helper, which will
+                // remove the entry AND notify the worker of the disconnect.
             }
         }
     }
 
-    // Channel closed — remove stale entry and report gone
-    {
-        let mut sse = state.sse_connections.write().await;
-        sse.remove(&path);
-    }
-    tracing::debug!(path, "removed stale SSE connection on push failure");
+    // Channel closed — the receiver has been dropped, meaning axum already
+    // tore down the stream. Run the shared cleanup so the worker hears about
+    // the disconnect (previously this path silently removed the entry).
+    router::cleanup_sse_connection(&state, &path, "push_failure", &connection_id).await;
 
     (
         StatusCode::GONE,

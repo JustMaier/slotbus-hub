@@ -23,12 +23,35 @@ use slotbus_hub::types::*;
 
 // ---- Configuration -----------------------------------------------------------
 
+/// Default SSE sweep interval.
+///
+/// axum's built-in `KeepAlive::default()` emits a comment frame every 15s.
+/// We run an independent sweeper at a shorter interval that probes every
+/// connection's `mpsc::Sender` with `try_send`. The sweeper detects two
+/// things:
+///   - Closed channels — axum already dropped the receiver (e.g., after a
+///     keepalive write failed or the response finished cleanly) but nobody
+///     has run cleanup yet. The sweeper cleans up and notifies the worker.
+///   - Forced stream pumping — a successful `try_send` queues a real event
+///     for the mapped stream to pull, which asks axum to write bytes to the
+///     TCP socket. That write can surface a dead peer sooner than axum's
+///     idle keepalive timer would on its own.
+///
+/// It doesn't eliminate dependence on axum's pipeline running at all — a
+/// stream stuck before it sees the ping will still linger — but in practice
+/// it shortens detection latency for the common failure modes.
+pub const DEFAULT_SSE_SWEEP_INTERVAL_MS: u64 = 5_000;
+
 /// Hub-level configuration (from CLI args).
 pub struct HubConfig {
     pub timeout_secs: u64,
     pub num_slots: usize,
     pub region_size: usize,
     pub instrumentation: bool,
+    /// How often the SSE liveness sweeper runs, in milliseconds. A value of
+    /// `0` disables the sweeper entirely (falls back to axum's built-in
+    /// `KeepAlive` + drop-guard detection).
+    pub sse_sweep_interval_ms: u64,
 }
 
 // ---- SSE connection state ----------------------------------------------------
@@ -84,6 +107,8 @@ struct RouteEntry {
 pub fn build_router(config: HubConfig) -> Router {
     let (event_tx, _) = broadcast::channel::<HubEvent>(256);
 
+    let sweep_interval_ms = config.sse_sweep_interval_ms;
+
     let state = Arc::new(HubState {
         workers: RwLock::new(HashMap::new()),
         route_table: RwLock::new(Vec::new()),
@@ -91,6 +116,13 @@ pub fn build_router(config: HubConfig) -> Router {
         sse_connections: RwLock::new(HashMap::new()),
         config,
     });
+
+    // Kick off the SSE liveness sweeper. Detects dead clients whose TCP
+    // disconnect hasn't propagated through axum (notably idle Windows streams
+    // that get force-killed).
+    if sweep_interval_ms > 0 {
+        spawn_sse_sweeper(Arc::clone(&state), Duration::from_millis(sweep_interval_ms));
+    }
 
     Router::new()
         .route("/internal/register", post(register_worker))
@@ -103,6 +135,116 @@ pub fn build_router(config: HubConfig) -> Router {
         .fallback(proxy_handler)
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+// ---- SSE liveness sweeper ----------------------------------------------------
+
+/// Spawn a background task that probes every hub-managed SSE connection on
+/// a fixed interval. When a probe reveals that the client's `mpsc` receiver
+/// has been dropped, we route through the shared cleanup helper which
+/// removes the map entry and dispatches `sse_lifecycle: "disconnect"` to the
+/// worker.
+///
+/// Why this exists: axum's `KeepAlive` plus the drop-guard pattern is the
+/// primary disconnect mechanism, but in practice a hard-killed client on
+/// Windows can leave an idle stream stuck in a state where axum's 15s idle
+/// keepalive timer doesn't surface a failed write quickly. The sweeper runs
+/// at a shorter cadence and queues a real event for the mapped stream to
+/// pull, which asks axum to write bytes to the socket sooner than it would
+/// otherwise. It also catches channels whose receiver has already been
+/// dropped but haven't been cleaned up yet.
+fn spawn_sse_sweeper(state: Arc<HubState>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // If a tick is delayed (e.g., the runtime was busy), skip the
+        // backlog rather than fire N ticks back-to-back.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first tick — nothing to sweep at startup.
+        ticker.tick().await;
+
+        tracing::info!(
+            interval_ms = interval.as_millis() as u64,
+            "SSE sweeper started"
+        );
+
+        loop {
+            ticker.tick().await;
+            sweep_once(&state).await;
+        }
+    });
+}
+
+/// Single sweep iteration. Separated so it can be called directly from
+/// tests or debug tools.
+async fn sweep_once(state: &Arc<HubState>) {
+    // Snapshot (path, connection_id, sender) under a read lock so we release
+    // the lock before doing any async work. We clone the Sender (cheap — it's
+    // an `Arc` internally) so each probe attempt has its own handle, and we
+    // capture the connection_id so `cleanup_sse_connection` can no-op if the
+    // entry has been replaced by a new client on the same path between
+    // probe and cleanup.
+    let probes: Vec<(String, String, mpsc::Sender<SseEvent>)> = {
+        let sse = state.sse_connections.read().await;
+        sse.iter()
+            .map(|(path, info)| {
+                (
+                    path.clone(),
+                    info.connection_id.clone(),
+                    info.sender.clone(),
+                )
+            })
+            .collect()
+    };
+
+    if probes.is_empty() {
+        return;
+    }
+
+    // Queue a liveness probe on each connection. `sse_ping` is a reserved
+    // internal event type that clients are expected to ignore; it exists so
+    // that the stream has traffic to drive the axum writer on otherwise
+    // idle connections. A failed write on the underlying socket will abort
+    // the stream, drop the receiver, and fire our drop guard — which is
+    // handled by the normal cleanup path below.
+    let mut closed: Vec<(String, String)> = Vec::new();
+    for (path, connection_id, sender) in &probes {
+        match sender.try_send(SseEvent {
+            event_type: "sse_ping".to_string(),
+            data: String::new(),
+        }) {
+            Ok(()) => {
+                // Event queued. Axum's stream pipeline will pull it on its
+                // next poll and attempt to write to the socket.
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Buffer is backpressured — receiver still exists but hasn't
+                // drained 256 queued events. We don't treat this as dead;
+                // if the client is genuinely stuck the OS-level TCP stack
+                // will eventually surface the failure via the retransmit
+                // timeout, at which point axum drops the stream and we'll
+                // see Closed on the next sweep.
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                closed.push((path.clone(), connection_id.clone()));
+            }
+        }
+    }
+
+    if closed.is_empty() {
+        return;
+    }
+
+    tracing::debug!(count = closed.len(), "SSE sweeper found closed channels");
+
+    // Spawn cleanups concurrently. `dispatch_sse_lifecycle` can block on
+    // SHM dispatch to a worker; if one worker is wedged we do NOT want that
+    // to stall sweeps for every other worker's connections.
+    for (path, connection_id) in closed {
+        let state = Arc::clone(state);
+        tokio::spawn(async move {
+            cleanup_sse_connection(&state, &path, "sweeper", &connection_id).await;
+        });
+    }
 }
 
 // ---- POST /internal/register -------------------------------------------------
@@ -452,16 +594,15 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
 
 // ---- SSE delegation ----------------------------------------------------------
 
-/// Drop guard that cleans up SSE connection state and notifies the worker.
-/// Uses `connection_id` to avoid removing a replacement entry (race condition:
-/// Client A disconnects after Client B connects on the same path).
+/// Drop guard that cleans up SSE connection state and notifies the worker
+/// when axum finishes serving the response (TCP close, keepalive write
+/// failure, etc.). Uses `connection_id` to avoid removing a replacement
+/// entry on the same path (race: Client A disconnects after Client B
+/// already connected with the same path).
 struct SseDropGuard {
     connection_id: String,
     path: String,
     state: Arc<HubState>,
-    worker_id: String,
-    path_pattern: String,
-    params: HashMap<String, String>,
 }
 
 impl Drop for SseDropGuard {
@@ -469,45 +610,9 @@ impl Drop for SseDropGuard {
         let connection_id = self.connection_id.clone();
         let path = self.path.clone();
         let state = Arc::clone(&self.state);
-        let worker_id = self.worker_id.clone();
-        let path_pattern = self.path_pattern.clone();
-        let params = self.params.clone();
 
         tokio::spawn(async move {
-            // Only remove if this connection still owns the entry
-            let removed = {
-                let mut sse = state.sse_connections.write().await;
-                if let Some(info) = sse.get(&path) {
-                    if info.connection_id == connection_id {
-                        sse.remove(&path);
-                        true
-                    } else {
-                        tracing::debug!(
-                            path,
-                            old_conn = connection_id,
-                            "SSE drop guard skipped: entry belongs to a newer connection"
-                        );
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-
-            if removed {
-                tracing::info!(path, worker_id, "SSE client disconnected");
-
-                // Notify worker of disconnect (fire-and-forget)
-                dispatch_sse_lifecycle(
-                    &state,
-                    &worker_id,
-                    "disconnect",
-                    &path,
-                    &path_pattern,
-                    &params,
-                )
-                .await;
-            }
+            cleanup_sse_connection(&state, &path, "drop_guard", &connection_id).await;
         });
     }
 }
@@ -557,14 +662,14 @@ async fn handle_sse_delegation(
     dispatch_sse_lifecycle(&state, &worker_id, "connect", &path, &route_pattern, &path_params)
         .await;
 
-    // Build the SSE stream with a drop guard for disconnect detection
+    // Build the SSE stream with a drop guard for disconnect detection.
+    // The guard only needs the connection_id + path + state; `cleanup_sse_connection`
+    // looks up worker_id/pattern/params from the live map entry so we don't drift
+    // if something reassigns the entry behind us.
     let drop_guard = SseDropGuard {
         connection_id,
         path: path.clone(),
         state: Arc::clone(&state),
-        worker_id,
-        path_pattern: route_pattern,
-        params: path_params,
     };
 
     let stream = ReceiverStream::new(rx).map(move |sse_event| {
@@ -578,6 +683,73 @@ async fn handle_sse_delegation(
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Remove an SSE connection from the active map and notify the worker of
+/// the disconnect via SHM. Single place where all dead-client cleanup goes:
+///   - `SseDropGuard::drop` (axum detected TCP failure via keepalive or data write)
+///   - `sse_push` (a worker push returned TrySendError::Closed)
+///   - `sweep_once` (periodic liveness probe returned TrySendError::Closed)
+///
+/// `reason` is a short tag threaded into the log line for diagnostics — it
+/// does NOT get sent to the worker, which only receives the standard
+/// `sse_lifecycle: "disconnect"` notification regardless of how we detected
+/// the dead client.
+///
+/// `expected_connection_id` is mandatory. Every caller captures the id of
+/// the specific connection they observed dying, and we only remove the map
+/// entry if its `connection_id` still matches. This is load-bearing: the
+/// map is keyed by path, and a new client can take the same path between
+/// the moment we observed the old one dying and the moment we run cleanup.
+/// Without the id check we'd evict the replacement and dispatch a spurious
+/// disconnect for it.
+pub(crate) async fn cleanup_sse_connection(
+    state: &Arc<HubState>,
+    path: &str,
+    reason: &'static str,
+    expected_connection_id: &str,
+) {
+    // Remove the entry from the map and capture what we need for the SHM
+    // dispatch. Bail out early if the entry is already gone (double cleanup)
+    // or belongs to a newer connection (race with a replacement on the same
+    // path). The compare-and-swap runs under the write lock so no one can
+    // slip a replacement in between our check and the remove.
+    let (worker_id, path_pattern, params) = {
+        let mut sse = state.sse_connections.write().await;
+        let info = match sse.get(path) {
+            Some(info) => info,
+            None => return,
+        };
+        if info.connection_id != expected_connection_id {
+            tracing::debug!(
+                path,
+                old_conn = expected_connection_id,
+                current_conn = %info.connection_id,
+                reason,
+                "SSE cleanup skipped: entry belongs to a newer connection"
+            );
+            return;
+        }
+        let snapshot = (
+            info.worker_id.clone(),
+            info.path_pattern.clone(),
+            info.params.clone(),
+        );
+        sse.remove(path);
+        snapshot
+    };
+
+    tracing::info!(path, worker_id, reason, "SSE client disconnected");
+
+    dispatch_sse_lifecycle(
+        state,
+        &worker_id,
+        "disconnect",
+        path,
+        &path_pattern,
+        &params,
+    )
+    .await;
 }
 
 /// Dispatch an SSE lifecycle notification (connect/disconnect) to a worker via SHM.

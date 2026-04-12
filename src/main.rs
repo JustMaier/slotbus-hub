@@ -32,6 +32,15 @@ struct Cli {
     /// Enable latency instrumentation logging.
     #[arg(long)]
     instrumentation: bool,
+
+    /// SSE liveness sweep interval in milliseconds.
+    ///
+    /// The hub probes every hub-managed SSE connection on this interval and
+    /// notifies the registered worker via `sse_lifecycle: "disconnect"` when
+    /// it detects a dead client. Set to `0` to disable and fall back to
+    /// axum's built-in keepalive only.
+    #[arg(long, default_value_t = router::DEFAULT_SSE_SWEEP_INTERVAL_MS)]
+    sse_sweep_interval_ms: u64,
 }
 
 #[tokio::main]
@@ -50,6 +59,7 @@ async fn main() {
         num_slots: cli.slots,
         region_size: cli.region_size,
         instrumentation: cli.instrumentation,
+        sse_sweep_interval_ms: cli.sse_sweep_interval_ms,
     };
 
     let app = router::build_router(hub_config);
