@@ -3,10 +3,10 @@ members = [".", "slotbus-ffi", "examples/rust-worker"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
-authors = ["Justin Zipperle"]
+authors = ["Justin Maier"]
 license = "MIT"
 
 [package]
@@ -24,9 +24,7 @@ keywords = ["ipc", "shared-memory", "router", "http", "microservices"]
 readme = "README.md"
 
 [dependencies]
-# For local development, use path dependency:
-slotbus = { path = "../slotbus/slotbus" }
-# For publishing, switch to: slotbus = "0.1"
+slotbus = "0.1"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
