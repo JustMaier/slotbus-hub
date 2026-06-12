@@ -42,6 +42,24 @@ use slotbus_hub::types::*;
 /// it shortens detection latency for the common failure modes.
 pub const DEFAULT_SSE_SWEEP_INTERVAL_MS: u64 = 5_000;
 
+/// Reserved route every worker answers via the SDK. The liveness reaper
+/// round-trips this over each worker's SHM to prove the path is actually
+/// alive — not merely registered. Kept in sync with the SDK's
+/// `worker::WORKER_PING_ROUTE`.
+const WORKER_PING_ROUTE: &str = "/__ping__";
+
+/// How often the liveness reaper probes every registered worker.
+const LIVENESS_REAP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Per-probe SHM round-trip timeout. A live worker answers `/__ping__`
+/// immediately (no handler work), so this is generous.
+const LIVENESS_PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Consecutive missed probes before a worker is evicted. At a 10s interval
+/// that's ~30s of silence — long enough to ride out a momentarily saturated
+/// worker, short enough to self-heal after a sleep/wake without a restart.
+const LIVENESS_MAX_MISSES: u32 = 3;
+
 /// Hub-level configuration (from CLI args).
 pub struct HubConfig {
     pub timeout_secs: u64,
@@ -123,6 +141,11 @@ pub fn build_router(config: HubConfig) -> Router {
     if sweep_interval_ms > 0 {
         spawn_sse_sweeper(Arc::clone(&state), Duration::from_millis(sweep_interval_ms));
     }
+
+    // Kick off the worker liveness reaper. Probes each worker's SHM round-trip
+    // and evicts ones that go silent (e.g. after the host sleeps), so `/health`
+    // reflects real reachability and the SDK watchdog can re-register.
+    spawn_liveness_reaper(Arc::clone(&state));
 
     Router::new()
         .route("/internal/register", post(register_worker))
@@ -244,6 +267,104 @@ async fn sweep_once(state: &Arc<HubState>) {
         tokio::spawn(async move {
             cleanup_sse_connection(&state, &path, "sweeper", &connection_id).await;
         });
+    }
+}
+
+// ---- Worker liveness reaper --------------------------------------------------
+
+/// Spawn a background task that probes every registered worker's SHM
+/// round-trip on a fixed interval and evicts ones that stop responding.
+///
+/// Registration alone is not liveness: a worker process can stay listed in
+/// `/health` while its SHM signaling is dead (notably after the host sleeps
+/// and wakes — kernel handles survive but the round-trip can silently break).
+/// The hub otherwise only removes a worker when a same-named worker
+/// re-registers, so a zombie would linger forever and the SDK watchdog —
+/// which keys off `worker_id` presence in `/health` — would never reconnect.
+///
+/// The reaper closes that gap: it dispatches a reserved `GET /__ping__` over
+/// each worker's bus. After [`LIVENESS_MAX_MISSES`] consecutive failures the
+/// worker is evicted (same cleanup as the stale-worker path), its id drops
+/// from `/health`, and the SDK re-registers on its next poll.
+fn spawn_liveness_reaper(state: Arc<HubState>) {
+    tokio::spawn(async move {
+        let mut misses: HashMap<String, u32> = HashMap::new();
+        let mut ticker = tokio::time::interval(LIVENESS_REAP_INTERVAL);
+        // The first tick fires immediately; skip it so freshly-registered
+        // workers get a full interval before their first probe.
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+
+            // Snapshot (worker_id, name, bus) so we don't hold the lock across
+            // the awaited probes.
+            let snapshot: Vec<(String, String, Arc<SlotBus>)> = {
+                let workers = state.workers.read().await;
+                workers
+                    .iter()
+                    .map(|(id, r)| (id.clone(), r.name.clone(), Arc::clone(&r.bus)))
+                    .collect()
+            };
+
+            // Forget miss counters for workers that are already gone.
+            misses.retain(|id, _| snapshot.iter().any(|(wid, _, _)| wid == id));
+
+            for (worker_id, name, bus) in snapshot {
+                if ping_worker(&bus).await {
+                    misses.remove(&worker_id);
+                    continue;
+                }
+
+                let count = misses.entry(worker_id.clone()).or_insert(0);
+                *count += 1;
+                if *count >= LIVENESS_MAX_MISSES {
+                    tracing::warn!(
+                        name,
+                        worker_id,
+                        misses = *count,
+                        "evicting unresponsive worker (SHM liveness probe failed)"
+                    );
+                    evict_worker(&state, &worker_id).await;
+                    misses.remove(&worker_id);
+                } else {
+                    tracing::debug!(name, worker_id, misses = *count, "worker liveness probe miss");
+                }
+            }
+        }
+    });
+}
+
+/// Round-trip the reserved ping route over a worker's SHM bus. Returns `true`
+/// only if the worker answered within [`LIVENESS_PING_TIMEOUT`].
+async fn ping_worker(bus: &Arc<SlotBus>) -> bool {
+    let meta = RequestMeta {
+        path: WORKER_PING_ROUTE.to_string(),
+        route_pattern: WORKER_PING_ROUTE.to_string(),
+        path_params: Vec::new(),
+        query: None,
+        headers: Vec::new(),
+    };
+    let req_id = uuid::Uuid::new_v4().to_string();
+    let rx = match bus.dispatch(&req_id, "GET", &meta, &[]) {
+        Ok(rx) => rx,
+        // No free slot / write failure also counts as a missed probe.
+        Err(_) => return false,
+    };
+    matches!(tokio::time::timeout(LIVENESS_PING_TIMEOUT, rx).await, Ok(Ok(_)))
+}
+
+/// Remove a worker and all of its routes. Mirrors the stale-worker cleanup in
+/// [`register_worker`], but keyed by exact `worker_id` so it can't race-delete
+/// a replacement that re-registered under the same name.
+async fn evict_worker(state: &Arc<HubState>, worker_id: &str) {
+    {
+        let mut workers = state.workers.write().await;
+        workers.remove(worker_id);
+    }
+    {
+        let mut table = state.route_table.write().await;
+        table.retain(|entry| entry.worker_id != worker_id);
     }
 }
 

@@ -12,6 +12,11 @@ use slotbus::SlotBusConfig;
 
 use crate::types::*;
 
+/// Reserved route the SDK answers automatically so the hub's liveness reaper
+/// can prove the SHM round-trip is alive. Kept in sync with the hub's
+/// `router::WORKER_PING_ROUTE`. Implementers never see or handle this.
+pub const WORKER_PING_ROUTE: &str = "/__ping__";
+
 // ---- Handler Response --------------------------------------------------------
 
 /// Response returned by worker handler functions.
@@ -346,7 +351,7 @@ async fn run_once<S: Send + Sync + 'static>(
     state: &Arc<S>,
 ) -> Result<(), String> {
     // ── Register ─────────────────────────────────────────────────────────
-    let route_regs: Vec<RouteRegistration> = routes
+    let mut route_regs: Vec<RouteRegistration> = routes
         .iter()
         .map(|r| RouteRegistration {
             method: r.method.clone(),
@@ -354,6 +359,16 @@ async fn run_once<S: Send + Sync + 'static>(
             sse: r.sse,
         })
         .collect();
+
+    // Advertise the reserved liveness route so the hub can route `/__ping__`
+    // (the reaper dispatches it over SHM; it's also reachable via HTTP proxy).
+    // The response is short-circuited in `dispatch_request`, so there's no
+    // implementer-provided handler for it.
+    route_regs.push(RouteRegistration {
+        method: "GET".to_string(),
+        path: WORKER_PING_ROUTE.to_string(),
+        sse: false,
+    });
 
     let reg_req = RegisterRequest {
         name: name.to_string(),
@@ -499,6 +514,12 @@ async fn dispatch_request<S: Send + Sync + 'static>(
     state: Arc<S>,
     request: ShmRequest,
 ) -> HandlerResponse {
+    // Reserved liveness probe — answered by the SDK, never dispatched to an
+    // implementer handler. Keeps `/health` honest via the hub's reaper.
+    if request.method == "GET" && request.route_pattern == WORKER_PING_ROUTE {
+        return HandlerResponse::ok();
+    }
+
     let handler = routes
         .iter()
         .find(|r| r.method == request.method && r.path == request.route_pattern);
