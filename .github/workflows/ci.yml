@@ -14,9 +14,9 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Clone slotbus dependency
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: JustMaier/slotbus
           path: .slotbus
@@ -36,9 +36,9 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Clone slotbus dependency
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: JustMaier/slotbus
           path: .slotbus
@@ -64,9 +64,9 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Clone slotbus dependency
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: JustMaier/slotbus
           path: .slotbus
@@ -88,9 +88,9 @@ jobs:
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Clone slotbus dependency
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: JustMaier/slotbus
           path: .slotbus
@@ -109,9 +109,9 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Clone slotbus dependency
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: JustMaier/slotbus
           path: .slotbus
@@ -149,9 +149,9 @@ jobs:
     runs-on: windows-latest
     needs: ffi-build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Clone slotbus dependency
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: JustMaier/slotbus
           path: .slotbus
@@ -161,7 +161,7 @@ jobs:
         run: mklink /J "%CD%\..\slotbus" "%CD%\.slotbus"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
       - name: Build FFI DLL
@@ -194,9 +194,9 @@ jobs:
     runs-on: windows-latest
     needs: ffi-build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Clone slotbus dependency
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: JustMaier/slotbus
           path: .slotbus
@@ -206,7 +206,7 @@ jobs:
         run: mklink /J "%CD%\..\slotbus" "%CD%\.slotbus"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "18"
       - name: Build FFI DLL
