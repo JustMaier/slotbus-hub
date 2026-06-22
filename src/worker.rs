@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use slotbus::transport::{Request as ShmRequest, SlotWorker};
 use slotbus::SlotBusConfig;
@@ -420,12 +422,23 @@ async fn run_once<S: Send + Sync + 'static>(
     let state_for_loop = Arc::clone(state);
     let name_for_loop = name.to_string();
 
+    // Track in-flight response tasks. Each request is handled in a detached
+    // tokio task that writes its response into the SHM region. On reconnect
+    // the region is torn down/replaced; if a response task is still running it
+    // would write into freed shared memory → access violation in
+    // `write_response`. We count outstanding tasks and drain them before
+    // dropping the region (see cleanup below).
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let in_flight_loop = Arc::clone(&in_flight);
+
     let receive_join = transport_for_loop.start_receive_loop(move |worker, slot_index, request| {
         let routes = Arc::clone(&routes_for_loop);
         let state = Arc::clone(&state_for_loop);
         let worker_name = name_for_loop.clone();
         let worker = Arc::clone(&worker);
+        let in_flight = Arc::clone(&in_flight_loop);
 
+        in_flight.fetch_add(1, Ordering::SeqCst);
         rt_handle.spawn(async move {
             let response = dispatch_request(&worker_name, &routes, state, request).await;
 
@@ -441,6 +454,7 @@ async fn run_once<S: Send + Sync + 'static>(
                     worker_name.to_uppercase()
                 );
             }
+            in_flight.fetch_sub(1, Ordering::SeqCst);
         });
     });
 
@@ -470,6 +484,24 @@ async fn run_once<S: Send + Sync + 'static>(
     // once `stop()` wakes the req_event, but we don't want to block forever
     // if something is wedged.
     let _ = receive_join.join();
+
+    // Drain in-flight response tasks BEFORE returning — the caller will
+    // reconnect and drop/replace this SHM region, and any task still inside
+    // `send_response`/`write_response` would write into freed shared memory
+    // (access violation). The receive loop is already stopped, so no new
+    // tasks spawn; wait (bounded) for the outstanding ones to finish.
+    let drain_start = Instant::now();
+    while in_flight.load(Ordering::SeqCst) > 0 {
+        if drain_start.elapsed() > Duration::from_secs(5) {
+            eprintln!(
+                "[{}] WARN: {} response task(s) still in-flight after 5s drain timeout; proceeding to reconnect",
+                name.to_uppercase(),
+                in_flight.load(Ordering::SeqCst)
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     Err(reason)
 }
