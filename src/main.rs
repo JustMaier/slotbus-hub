@@ -77,11 +77,17 @@ async fn main() {
     // A secret is required whenever the hub is reachable from off-box. Refusing
     // to start is deliberate: silently serving an unauthenticated API on a LAN
     // address is the failure mode worth being loud about.
-    let secret = std::env::var("HUB_SECRET").ok().filter(|s| !s.is_empty());
+    // A too-weak secret is rejected on any bind, loopback included: it is a
+    // config error, and failing loudly beats enforcing something guessable.
+    let secret = auth::resolve_secret(std::env::var("HUB_SECRET").ok()).unwrap_or_else(|e| {
+        tracing::error!("Refusing to start: {e}.");
+        std::process::exit(1);
+    });
+
     if !loopback_only && secret.is_none() {
         tracing::error!(
-            "Refusing to start: bind address {addr} is not loopback and HUB_SECRET is unset or empty. \
-             Set HUB_SECRET to a shared secret, or bind to 127.0.0.1."
+            "Refusing to start: bind address {addr} is not loopback and HUB_SECRET is unset, empty, \
+             or whitespace-only. Set HUB_SECRET to a shared secret, or bind to 127.0.0.1."
         );
         std::process::exit(1);
     }

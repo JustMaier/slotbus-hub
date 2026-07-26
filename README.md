@@ -73,8 +73,16 @@ The rules:
 - **The peer address comes from the TCP connection**, never from a header.
   `X-Forwarded-For` and friends are ignored — put the hub behind a reverse proxy
   only if you also terminate auth there.
-- **Startup fails closed.** A non-loopback `--bind` with `HUB_SECRET` unset or
-  empty refuses to start rather than exposing an open API.
+- **Startup fails closed.** A non-loopback `--bind` with `HUB_SECRET` unset,
+  empty, or whitespace-only refuses to start rather than exposing an open API.
+- **Secrets must be at least 16 characters** after trimming, on any bind. A
+  shorter one is a config error and the hub refuses to start.
+
+Surrounding whitespace is stripped from `HUB_SECRET`, because HTTP strips
+whitespace around header values in transit — an untrimmed secret could never be
+sent intact. On Windows, `--bind ::` is IPv6-only and will not accept IPv4
+connections, so local clients using `127.0.0.1` would break; use `0.0.0.0` or a
+specific address instead.
 
 Secrets are compared in constant time. Bind to the narrowest address that works
 (a specific LAN IP beats `0.0.0.0`) and firewall the port to your local subnet.

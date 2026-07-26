@@ -44,3 +44,7 @@ uuid = { version = "1", features = ["v4"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 subtle = "2"
+
+[dev-dependencies]
+# `ServiceExt::oneshot` drives the built router in the auth middleware tests.
+tower = { version = "0.5", features = ["util"] }
