@@ -44,12 +44,40 @@ slotbus-hub --instrumentation
 | Flag | Default | Description |
 |---|---|---|
 | `--port` | `3200` | HTTP listen port |
+| `--bind` | `127.0.0.1` | IP address to bind (env: `HUB_BIND`). Any non-loopback value requires `HUB_SECRET` — see [Network Exposure](#network-exposure). |
 | `--timeout` | `30` | Request timeout in seconds. Returns `504 Gateway Timeout` if a worker doesn't respond in time. |
 | `--slots` | `32` | Number of SHM slots per worker. More slots = more concurrent in-flight requests. |
 | `--region-size` | `1048576` | SHM region size per worker in bytes (default 1 MB). |
 | `--instrumentation` | `false` | Enable latency instrumentation logging via `tracing`. |
 
 Logging is controlled by the `RUST_LOG` environment variable (default: `info`).
+
+## Network Exposure
+
+By default the hub binds `127.0.0.1` and is unauthenticated, which is safe
+because nothing off-box can reach it. To serve clients on other machines, bind a
+reachable address and set a shared secret:
+
+```bash
+HUB_SECRET='<long random string>' slotbus-hub --bind 0.0.0.0
+```
+
+The rules:
+
+- **Loopback peers are exempt.** Requests from `127.0.0.0/8` or `::1` never need
+  a header, so existing local clients keep working unchanged.
+- **Everyone else must send `X-Hub-Secret`** matching `HUB_SECRET`, or the
+  request gets `401`. This covers every route, including `/health`, the
+  `/internal/*` control plane, both SSE streams, and all worker-registered paths
+  served through the fallback proxy.
+- **The peer address comes from the TCP connection**, never from a header.
+  `X-Forwarded-For` and friends are ignored — put the hub behind a reverse proxy
+  only if you also terminate auth there.
+- **Startup fails closed.** A non-loopback `--bind` with `HUB_SECRET` unset or
+  empty refuses to start rather than exposing an open API.
+
+Secrets are compared in constant time. Bind to the narrowest address that works
+(a specific LAN IP beats `0.0.0.0`) and firewall the port to your local subnet.
 
 ## How It Works
 

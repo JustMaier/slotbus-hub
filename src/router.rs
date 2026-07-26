@@ -122,7 +122,7 @@ struct RouteEntry {
 
 // ---- Build router ------------------------------------------------------------
 
-pub fn build_router(config: HubConfig) -> Router {
+pub fn build_router(config: HubConfig, auth: crate::auth::AuthState) -> Router {
     let (event_tx, _) = broadcast::channel::<HubEvent>(256);
 
     let sweep_interval_ms = config.sse_sweep_interval_ms;
@@ -156,8 +156,16 @@ pub fn build_router(config: HubConfig) -> Router {
         .route("/events/{channel}", get(events::scoped_sse))
         .route("/health", get(health))
         .fallback(proxy_handler)
-        .layer(CorsLayer::permissive())
         .with_state(state)
+        // Whole-router layer: wraps every route above *and* the fallback proxy,
+        // which is what carries all worker-registered paths (including SSE).
+        // Sits inside CORS so preflight is answered before auth and so 401s
+        // still carry CORS headers.
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::require_secret,
+        ))
+        .layer(CorsLayer::permissive())
 }
 
 // ---- SSE liveness sweeper ----------------------------------------------------
