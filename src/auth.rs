@@ -75,9 +75,7 @@ pub fn resolve_secret(raw: Option<String>) -> Result<Option<String>, SecretError
         return Ok(None);
     }
     if trimmed.len() < MIN_SECRET_LEN {
-        return Err(SecretError::TooShort {
-            len: trimmed.len(),
-        });
+        return Err(SecretError::TooShort { len: trimmed.len() });
     }
     if trimmed.len() != raw.len() {
         tracing::warn!(
@@ -118,9 +116,7 @@ impl AuthState {
 pub fn is_loopback_peer(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|m| m.is_loopback())
-        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|m| m.is_loopback()),
     }
 }
 
@@ -132,11 +128,7 @@ fn secret_matches(expected: &[u8], provided: &[u8]) -> bool {
 
 /// Auth middleware. Applied as a whole-router layer so it wraps every route
 /// *and* the fallback proxy handler.
-pub async fn require_secret(
-    State(auth): State<AuthState>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn require_secret(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
     let Some(expected) = auth.secret.clone() else {
         // Loopback-only deployment: nothing to enforce.
         return next.run(req).await;
@@ -313,7 +305,12 @@ mod tests {
     #[tokio::test]
     async fn remote_peer_with_wrong_secret_is_denied() {
         // Fails if the layer is removed.
-        for bad in [None, Some(""), Some("wrong"), Some("test-secret-value-012345678")] {
+        for bad in [
+            None,
+            Some(""),
+            Some("wrong"),
+            Some("test-secret-value-012345678"),
+        ] {
             assert_eq!(
                 status_of(request("/health", Some("192.168.0.9:5555"), bad)).await,
                 StatusCode::UNAUTHORIZED,
@@ -327,7 +324,12 @@ mod tests {
         // Guards against over-blocking; like the loopback case it cannot fail
         // if the layer is deleted.
         assert_eq!(
-            status_of(request("/health", Some("192.168.0.9:5555"), Some(TEST_SECRET))).await,
+            status_of(request(
+                "/health",
+                Some("192.168.0.9:5555"),
+                Some(TEST_SECRET)
+            ))
+            .await,
             StatusCode::OK
         );
     }
