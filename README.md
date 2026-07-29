@@ -184,6 +184,21 @@ slotbus = "0.1"
 
 A minimal worker: register routes with the hub via HTTP, open the SHM region using the returned `shm_name`, and start the receive loop. See the [slotbus README](https://github.com/JustMaier/slotbus#worker-side--connect-and-handle-requests) for the worker-side API.
 
+## Developing against a local slotbus
+
+`slotbus` resolves from crates.io, so `git clone && cargo build` works with
+nothing else on disk. To build against a sibling checkout of the
+[slotbus](https://github.com/JustMaier/slotbus) repo instead — when changing
+both crates together — create `.cargo/config.toml` (gitignored):
+
+```toml
+[patch.crates-io]
+slotbus = { path = "../slotbus/slotbus" }
+```
+
+The patch applies to the whole workspace, including `slotbus-ffi`. Delete the
+file to go back to the published crate.
+
 ## Platform Support
 
 slotbus-hub inherits platform support from the slotbus library:

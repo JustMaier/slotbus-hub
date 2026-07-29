@@ -14,5 +14,5 @@ dist/
 # Node
 node_modules/
 
-# CI dependency clone
-.slotbus/
+# Local-only override that points `slotbus` at a sibling checkout
+.cargo/config.toml

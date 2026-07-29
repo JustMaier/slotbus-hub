@@ -44,19 +44,6 @@ jobs:
             ffi_artifact: slotbus_ffi-aarch64-apple-darwin.dylib
     steps:
       - uses: actions/checkout@v4
-      - name: Clone slotbus dependency
-        uses: actions/checkout@v4
-        with:
-          repository: JustMaier/slotbus
-          path: .slotbus
-          token: ${{ secrets.SLOTBUS_PAT }}
-      - name: Link slotbus to expected path (Unix)
-        if: runner.os != 'Windows'
-        run: ln -s "$PWD/.slotbus" ../slotbus
-      - name: Link slotbus to expected path (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: mklink /J "%CD%\..\slotbus" "%CD%\.slotbus"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
