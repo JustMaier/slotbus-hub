@@ -94,8 +94,12 @@ impl HandlerResponse {
 // ---- Type-erased handler -----------------------------------------------------
 
 type BoxHandler<S> = Box<
-    dyn Fn(Arc<S>, HashMap<String, String>, Option<String>, Vec<u8>)
-            -> Pin<Box<dyn Future<Output = HandlerResponse> + Send>>
+    dyn Fn(
+            Arc<S>,
+            HashMap<String, String>,
+            Option<String>,
+            Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = HandlerResponse> + Send>>
         + Send
         + Sync,
 >;
@@ -405,15 +409,10 @@ async fn run_once<S: Send + Sync + 'static>(
     );
 
     // ── Open SHM region ──────────────────────────────────────────────────
-    let worker_config = SlotBusConfig::builder()
-        .name(name)
-        .prefix("hub")
-        .build();
+    let worker_config = SlotBusConfig::builder().name(name).prefix("hub").build();
 
-    let transport = Arc::new(
-        SlotWorker::open(worker_config)
-            .map_err(|e| format!("Failed to open SHM: {e}"))?,
-    );
+    let transport =
+        Arc::new(SlotWorker::open(worker_config).map_err(|e| format!("Failed to open SHM: {e}"))?);
 
     // ── SHM receive loop (blocking thread) ───────────────────────────────
     let rt_handle = tokio::runtime::Handle::current();
@@ -510,10 +509,10 @@ async fn run_once<S: Send + Sync + 'static>(
 /// is still in the active workers list.
 ///
 /// Returns:
-///   - `Ok(true)`  — hub reachable and we're still registered
-///   - `Ok(false)` — hub reachable but our worker_id is gone (hub restarted
-///                   or something else kicked us out)
-///   - `Err(_)`    — hub unreachable or response is unparseable
+/// - `Ok(true)`  — hub reachable and we're still registered
+/// - `Ok(false)` — hub reachable but our worker_id is gone (hub restarted
+///   or something else kicked us out)
+/// - `Err(_)`    — hub unreachable or response is unparseable
 async fn check_worker_registered(
     client: &reqwest::Client,
     health_url: &str,

@@ -42,8 +42,7 @@ async fn get_item(
 
 #[tokio::main]
 async fn main() {
-    let hub_url =
-        std::env::var("HUB_URL").unwrap_or_else(|_| "http://localhost:3200".into());
+    let hub_url = std::env::var("HUB_URL").unwrap_or_else(|_| "http://localhost:3200".into());
 
     let worker = HubWorker::new(&hub_url, "rust-api", AppState)
         .route("GET", "/status", status)

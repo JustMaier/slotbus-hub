@@ -128,7 +128,10 @@ pub async fn sse_push(
         }) {
             Ok(_) => return Json(serde_json::json!({"ok": true})).into_response(),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(path, "SSE channel full (256), dropping event for slow client");
+                tracing::warn!(
+                    path,
+                    "SSE channel full (256), dropping event for slow client"
+                );
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({

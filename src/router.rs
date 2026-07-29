@@ -328,7 +328,12 @@ fn spawn_liveness_reaper(state: Arc<HubState>) {
                     evict_worker(&state, &worker_id).await;
                     misses.remove(&worker_id);
                 } else {
-                    tracing::debug!(name, worker_id, misses = *count, "worker liveness probe miss");
+                    tracing::debug!(
+                        name,
+                        worker_id,
+                        misses = *count,
+                        "worker liveness probe miss"
+                    );
                 }
             }
         }
@@ -351,7 +356,10 @@ async fn ping_worker(bus: &Arc<SlotBus>) -> bool {
         // No free slot / write failure also counts as a missed probe.
         Err(_) => return false,
     };
-    matches!(tokio::time::timeout(LIVENESS_PING_TIMEOUT, rx).await, Ok(Ok(_)))
+    matches!(
+        tokio::time::timeout(LIVENESS_PING_TIMEOUT, rx).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Remove a worker and all of its routes. Mirrors the stale-worker cleanup in
@@ -463,11 +471,7 @@ async fn register_worker(
 
             for (path, info) in sse.iter_mut() {
                 if stale_ids.contains(&info.worker_id) {
-                    to_replay.push((
-                        path.clone(),
-                        info.params.clone(),
-                        info.path_pattern.clone(),
-                    ));
+                    to_replay.push((path.clone(), info.params.clone(), info.path_pattern.clone()));
                     info.worker_id = worker_id.clone();
                 }
             }
@@ -777,11 +781,23 @@ async fn handle_sse_delegation(
         );
     }
 
-    tracing::info!(path, worker_id, connection_id, "SSE client connected (delegated)");
+    tracing::info!(
+        path,
+        worker_id,
+        connection_id,
+        "SSE client connected (delegated)"
+    );
 
     // Notify worker of the connection via SHM
-    dispatch_sse_lifecycle(&state, &worker_id, "connect", &path, &route_pattern, &path_params)
-        .await;
+    dispatch_sse_lifecycle(
+        &state,
+        &worker_id,
+        "connect",
+        &path,
+        &route_pattern,
+        &path_params,
+    )
+    .await;
 
     // Build the SSE stream with a drop guard for disconnect detection.
     // The guard only needs the connection_id + path + state; `cleanup_sse_connection`
@@ -835,7 +851,7 @@ pub(crate) async fn cleanup_sse_connection(
     // or belongs to a newer connection (race with a replacement on the same
     // path). The compare-and-swap runs under the write lock so no one can
     // slip a replacement in between our check and the remove.
-    let (worker_id, path_pattern, params) = {
+    let (worker_id, path_pattern, params, connected_at) = {
         let mut sse = state.sse_connections.write().await;
         let info = match sse.get(path) {
             Some(info) => info,
@@ -855,12 +871,19 @@ pub(crate) async fn cleanup_sse_connection(
             info.worker_id.clone(),
             info.path_pattern.clone(),
             info.params.clone(),
+            info.connected_at.clone(),
         );
         sse.remove(path);
         snapshot
     };
 
-    tracing::info!(path, worker_id, reason, "SSE client disconnected");
+    tracing::info!(
+        path,
+        worker_id,
+        reason,
+        connected_at,
+        "SSE client disconnected"
+    );
 
     dispatch_sse_lifecycle(
         state,
