@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-01
+
+**Requires slotbus 0.2.** That release breaks the shared-memory wire protocol
+(`SHM_VERSION` 1 → 2), so the hub and every worker sharing a region must be
+rebuilt together. A mismatched peer is rejected at startup with
+`bad version: expected 2, got 1` rather than failing later on a large payload.
+
+### Security
+
+- **Reject worker names that could steer a filesystem path.**
+  `POST /internal/register` passed the caller-supplied `name` straight into the
+  region name, which slotbus 0.2 uses to locate a backing file it may delete
+  when reclaiming an orphan. A name containing `..` or a path separator could
+  therefore reach a file outside the backing directory. Names containing path
+  separators, `..`, `:` or NUL are now rejected with 400. slotbus 0.2 enforces
+  the same restriction independently; this is the outer of two layers.
+  Loopback registration is auth-exempt, so the exposure was to non-loopback
+  peers authenticated with `X-Hub-Secret`.
+
+### Changed
+
+- `slotbus` now resolves from crates.io rather than a sibling path dependency,
+  so the repository builds from a plain clone. To develop against a local
+  slotbus checkout, see "Developing against a local slotbus" in the README.
+- LAN binding and shared-secret auth: `--bind` accepts a non-loopback address
+  only when `HUB_SECRET` is set, and non-loopback peers must present
+  `X-Hub-Secret`. Loopback is exempt, so local clients are unaffected.
+
+### Fixed
+
+- SSE connections are swept for liveness, and a disconnect now logs how long
+  the connection had been open.
+
 ## [0.1.3] - 2026-07-09
 
 ### Fixed
