@@ -386,10 +386,52 @@ async fn evict_worker(state: &Arc<HubState>, worker_id: &str) {
 
 // ---- POST /internal/register -------------------------------------------------
 
+/// Characters a worker name may never contain.
+///
+/// The name becomes part of a shared-memory region name, and on Windows that
+/// reaches the filesystem as `%TEMP%\shared_memory-rs\<region>`. slotbus refuses
+/// to act on a name that is not a single path component, but the hub should not
+/// be handing it such names in the first place — this is the outer half of a
+/// defence in depth. Loopback registration is auth-exempt, so without this a
+/// LAN peer holding `X-Hub-Secret` could steer paths on the hub machine.
+fn invalid_worker_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("must not be empty");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Some("must not contain path separators");
+    }
+    if name.split(['/', '\\']).any(|part| part == "..") || name.contains("..") {
+        return Some("must not contain '..'");
+    }
+    if name.contains(':') {
+        return Some("must not contain ':'");
+    }
+    if name.contains('\0') {
+        return Some("must not contain NUL");
+    }
+    None
+}
+
 async fn register_worker(
     State(state): State<Arc<HubState>>,
     Json(req): Json<RegisterRequest>,
 ) -> impl IntoResponse {
+    if let Some(reason) = invalid_worker_name(&req.name) {
+        tracing::warn!(
+            name = req.name,
+            reason,
+            "rejected worker registration: unsafe name"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("worker name {reason}"),
+            })),
+        )
+            .into_response();
+    }
+
     let worker_id = uuid::Uuid::new_v4().to_string();
     let route_count = req.routes.len();
 
@@ -1223,5 +1265,51 @@ mod tests {
         assert_present(&state, "/agent/events/alive").await;
         assert_missing(&state, "/agent/events/dead").await;
         assert_present(&state, "/agent/events/slow").await;
+    }
+
+    /// A worker name becomes part of a shared-memory region name, which on
+    /// Windows reaches the filesystem. Anything that could steer a path must be
+    /// refused at the door.
+    #[test]
+    fn unsafe_worker_names_are_rejected() {
+        for bad in [
+            "",
+            "../../../etc",
+            "..",
+            "a/b",
+            r"a\b",
+            "C:/windows/system32",
+            "agent\0null",
+            "hub-../../../victim",
+        ] {
+            assert!(
+                invalid_worker_name(bad).is_some(),
+                "should have rejected {bad:?}"
+            );
+        }
+    }
+
+    /// Guards against over-blocking: the names actually in use must survive.
+    /// Without this the test above would pass if the check rejected everything.
+    #[test]
+    fn ordinary_worker_names_are_accepted() {
+        for good in [
+            "agent",
+            "tts",
+            "stt",
+            "ui",
+            "discord",
+            "project-store",
+            "node-api",
+            "sse-test",
+            "agent_2",
+            "Agent.v2",
+        ] {
+            assert_eq!(
+                invalid_worker_name(good),
+                None,
+                "should have accepted {good:?}"
+            );
+        }
     }
 }
