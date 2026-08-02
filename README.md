@@ -47,10 +47,30 @@ slotbus-hub --instrumentation
 | `--bind` | `127.0.0.1` | IP address to bind (env: `HUB_BIND`). Any non-loopback value requires `HUB_SECRET` — see [Network Exposure](#network-exposure). |
 | `--timeout` | `30` | Request timeout in seconds. Returns `504 Gateway Timeout` if a worker doesn't respond in time. |
 | `--slots` | `32` | Number of SHM slots per worker. More slots = more concurrent in-flight requests. |
-| `--region-size` | `1048576` | SHM region size per worker in bytes (default 1 MB). |
+| `--region-size` | `1048576` | SHM region size per worker in bytes (default 1 MB). See the sizing note below — this interacts with `--slots`. |
 | `--instrumentation` | `false` | Enable latency instrumentation logging via `tracing`. |
 
 Logging is controlled by the `RUST_LOG` environment variable (default: `info`).
+
+### Sizing `--region-size` against `--slots`
+
+slotbus 0.2 gives every slot a fixed arena, split into a request half and a
+response half, so the largest payload that stays inline is roughly:
+
+```
+region_size / slots / 2
+```
+
+Raising `--slots` therefore *lowers* the inline ceiling unless you raise
+`--region-size` with it. At the defaults (32 slots, 1 MB) the ceiling is ~16 KB
+per direction; at 64 slots on the same region it is ~8 KB.
+
+Payloads above the ceiling spill to an overflow region. That path is correct and
+supported, but releasing an overflow mapping costs on the order of tens of
+milliseconds — enough to dominate a round trip that is otherwise sub-millisecond.
+If your responses are consistently larger than the ceiling, raise the region
+rather than paying that on every request. A worker handling ~76 KB responses at
+64 slots wants roughly a 16 MB region.
 
 ## Network Exposure
 
@@ -215,8 +235,12 @@ The hub is just the router. To build a worker that connects to it, use the [slot
 
 ```toml
 [dependencies]
-slotbus = "0.1"
+slotbus = "0.2"
 ```
+
+The versions must match. slotbus 0.2 changed the shared-memory wire protocol
+(`SHM_VERSION` 1 → 2), so a 0.1 worker and a 0.2 hub cannot share a region — the
+mismatch is rejected at startup with `bad version: expected 2, got 1`.
 
 A minimal worker: register routes with the hub via HTTP, open the SHM region using the returned `shm_name`, and start the receive loop. See the [slotbus README](https://github.com/JustMaier/slotbus#worker-side--connect-and-handle-requests) for the worker-side API.
 
