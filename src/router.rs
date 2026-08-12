@@ -542,28 +542,73 @@ async fn register_worker(
                 "replaying SSE connections to new worker (background)"
             );
 
-            // Spawn replay in the background so registration returns immediately.
-            // Overall timeout prevents indefinite blocking if the worker is slow.
+            // Replay concurrently, not one after another.
+            //
+            // Sequentially, each `connect` waits up to 5s for the worker to
+            // acknowledge, against a 30s budget for the whole batch — so a
+            // worker with more than a handful of connections could never finish,
+            // and "skipping remaining" silently abandoned the rest. The hub had
+            // already re-pointed those connections at the new worker above, so
+            // the worker was never told about connections the hub believed it
+            // owned, and every abandoned client stayed invisible until it
+            // reconnected on its own.
+            //
+            // Measured 2026-08-12: restarting agent-server took 12 of 24 live
+            // agents out of the roster. They were running the whole time; the
+            // app simply could not route to them, and a chat message to one came
+            // back as "not running". The replay is the repair path, so it has to
+            // cover every connection, not the first few.
+            //
+            // Concurrent dispatch makes the batch cost one slow worker rather
+            // than the sum of them. The per-connection 5s ack wait stays: it is
+            // what makes a wedged worker's own connection fail rather than
+            // everyone else's.
             tokio::spawn(async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                let mut tasks = tokio::task::JoinSet::new();
                 for (path, params, pattern) in replay {
-                    if tokio::time::Instant::now() >= deadline {
-                        tracing::warn!(
-                            name = replay_name,
-                            worker_id = replay_worker_id,
-                            "SSE replay timed out (30s overall), skipping remaining"
-                        );
-                        break;
+                    let state = Arc::clone(&replay_state);
+                    let worker_id = replay_worker_id.clone();
+                    tasks.spawn(async move {
+                        dispatch_sse_lifecycle(
+                            &state, &worker_id, "connect", &path, &pattern, &params,
+                        )
+                        .await;
+                    });
+                }
+
+                // Generous overall bound: with the dispatches running in
+                // parallel this should finish in about one ack, so reaching it
+                // means something is genuinely wrong and worth saying loudly.
+                let mut done = 0usize;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    match tokio::time::timeout(remaining, tasks.join_next()).await {
+                        Ok(Some(_)) => done += 1,
+                        Ok(None) => break,
+                        Err(_) => break,
                     }
-                    dispatch_sse_lifecycle(
-                        &replay_state,
-                        &replay_worker_id,
-                        "connect",
-                        &path,
-                        &pattern,
-                        &params,
-                    )
-                    .await;
+                }
+
+                // Never let an incomplete replay pass as a completed one — an
+                // agent dropped here looks offline forever with nothing failing.
+                if done < replay_count {
+                    tracing::error!(
+                        name = replay_name,
+                        worker_id = replay_worker_id,
+                        replayed = done,
+                        total = replay_count,
+                        missing = replay_count - done,
+                        "SSE replay INCOMPLETE — those clients are invisible to the worker \
+                         until they reconnect"
+                    );
+                } else {
+                    tracing::info!(
+                        name = replay_name,
+                        worker_id = replay_worker_id,
+                        replayed = done,
+                        "SSE replay complete"
+                    );
                 }
             });
         }
