@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-12
+
+Both fixes are in the same place: what happens to a worker's shared-memory
+region when that worker restarts and a replacement registers under the same
+name. Nothing here changes the wire protocol, so 0.2.1 drops into a 0.2.0
+deployment without rebuilding workers.
+
+### Fixed
+
+- **Requests hung for the full request timeout across a worker restart.**
+  Two distinct causes, both from a replacement re-creating a region the
+  previous generation was still attached to.
+
+  Requests already parked on the old worker's region had nothing to wake
+  them. Removing the worker record does not: a request clones the
+  `Arc<SlotBus>` before dispatching and holds it while it waits, and the bus
+  owns the oneshot sender it waits on — so the waiter keeps alive the very
+  channel whose closure would have released it. Each worker record now
+  carries a `gone` notification, fired on both removal paths, which the
+  request selects on alongside the response. It is subscribed under the
+  workers read lock — eviction needs the write lock — so a departure cannot
+  land between lookup and subscribe.
+
+  More seriously, the old bus's response-watcher thread kept scanning a
+  region the new bus had re-created. Two watchers then shared one region, and
+  whichever won the `Done → Free` transition consumed the response; the stale
+  one has no pending entry for that request id, so it discarded the payload.
+  The new worker appeared to answer nothing and the caller waited out the
+  timeout. Eviction now stops the old bus before a replacement can share its
+  region.
+
+  Measured with a worker restarted under a request fired every 125ms across
+  the 3s transition window, 25 requests per restart: before, 2 of 6 restarts
+  stalled with six consecutive 30s requests each; after, 8 of 8 restarts
+  clean over 200 requests, worst case 1.11s — and that worst case is a prompt
+  502 rather than a hang.
+
+- **SSE replay gave up partway through on workers with many connections.**
+  On re-registration the hub re-points a worker's stale SSE connections at
+  the new worker id and notifies it one connection at a time. Each
+  notification waited up to 5s for an acknowledgement against a 30s budget
+  for the whole batch, so past roughly a dozen connections the loop hit its
+  deadline and logged `skipping remaining` — leaving the rest of the
+  connections attached to a worker id that no longer existed.
+
+### Documentation
+
+- README documents the slotbus 0.2 pairing and how to size regions.
+
 ## [0.2.0] - 2026-08-01
 
 **Requires slotbus 0.2.** That release breaks the shared-memory wire protocol
@@ -69,6 +118,8 @@ rebuilt together. A mismatched peer is rejected at startup with
 - CLI with configurable port and request timeout
 - CORS enabled for browser clients
 
-[Unreleased]: https://github.com/JustMaier/slotbus-hub/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/JustMaier/slotbus-hub/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/JustMaier/slotbus-hub/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/JustMaier/slotbus-hub/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/JustMaier/slotbus-hub/compare/v0.1.0...v0.1.3
 [0.1.0]: https://github.com/JustMaier/slotbus-hub/releases/tag/v0.1.0
