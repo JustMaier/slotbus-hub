@@ -110,6 +110,16 @@ struct WorkerRecord {
     name: String,
     routes: Vec<RouteRegistration>,
     bus: Arc<SlotBus>,
+    /// Fires once when this worker leaves the hub, so requests already parked
+    /// on its SHM stop waiting.
+    ///
+    /// Dropping the record is not enough to wake them. A request clones the
+    /// `Arc<SlotBus>` before dispatching and holds it until it returns, and
+    /// the bus owns the oneshot sender the request waits on — so the waiter
+    /// keeps alive the very channel whose closure would have released it.
+    /// Left alone it waits the full request timeout for a process that is
+    /// already gone.
+    gone: Arc<tokio::sync::Notify>,
 }
 
 /// Internal route table entry.
@@ -376,7 +386,12 @@ async fn ping_worker(bus: &Arc<SlotBus>) -> bool {
 async fn evict_worker(state: &Arc<HubState>, worker_id: &str) {
     {
         let mut workers = state.workers.write().await;
-        workers.remove(worker_id);
+        if let Some(record) = workers.remove(worker_id) {
+            // Same reasoning as the stale-worker path in `register_worker`:
+            // stop the watcher before a replacement can share its region.
+            record.bus.stop();
+            record.gone.notify_waiters();
+        }
     }
     {
         let mut table = state.route_table.write().await;
@@ -450,7 +465,26 @@ async fn register_worker(
         if !stale_ids.is_empty() {
             let mut table = state.route_table.write().await;
             for stale_id in &stale_ids {
-                workers.remove(stale_id);
+                if let Some(record) = workers.remove(stale_id) {
+                    // A worker re-registering under the same name means the
+                    // old process is gone. Release anything still waiting on
+                    // it rather than letting it sit out the request timeout —
+                    // after a rebuild that is the first call the UI makes.
+                    //
+                    // Stopping the old bus matters just as much, and is not
+                    // about tidiness: the replacement re-creates a region of
+                    // the SAME name, so until the old response watcher exits,
+                    // two watcher threads scan one region. The first to win
+                    // the Done→Free CAS consumes the response — and the stale
+                    // one has no pending entry for that request id, so it
+                    // drops the payload on the floor. The new worker looks
+                    // like it answered nothing and the caller waits out the
+                    // full timeout. Dropping the record cannot do this: the
+                    // in-flight requests hold `Arc<SlotBus>` clones and keep
+                    // the watcher alive.
+                    record.bus.stop();
+                    record.gone.notify_waiters();
+                }
                 table.retain(|entry| entry.worker_id != *stale_id);
             }
             tracing::info!(
@@ -509,6 +543,7 @@ async fn register_worker(
                 name: req.name.clone(),
                 routes: req.routes,
                 bus,
+                gone: Arc::new(tokio::sync::Notify::new()),
             },
         );
     }
@@ -750,8 +785,8 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
 
     // Look up worker
     let workers = state.workers.read().await;
-    let bus = match workers.get(&worker_id) {
-        Some(record) => Arc::clone(&record.bus),
+    let (bus, gone) = match workers.get(&worker_id) {
+        Some(record) => (Arc::clone(&record.bus), Arc::clone(&record.gone)),
         None => {
             return (
                 StatusCode::BAD_GATEWAY,
@@ -760,6 +795,15 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
                 .into_response();
         }
     };
+    // Subscribe while the read guard is still held. `notify_waiters` only
+    // wakes waiters that already exist, so a subscription taken after the
+    // lookup can miss an eviction that lands in between — and that waiter
+    // then sleeps through its own worker's departure for the full timeout.
+    // Eviction needs the write lock, so holding the read lock across the
+    // subscribe makes the gap unrepresentable rather than merely small.
+    let gone_signal = gone.notified();
+    tokio::pin!(gone_signal);
+    gone_signal.as_mut().enable();
     drop(workers);
 
     // Build request metadata
@@ -780,10 +824,25 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
         }
     };
 
-    // Wait for response
+    // Wait for the response, the worker's departure, or the timeout —
+    // whichever comes first.
     let timeout = Duration::from_secs(state.config.timeout_secs);
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(resp)) => {
+    let settled = async {
+        tokio::select! {
+            // Biased: if the response and the eviction land together, the
+            // response is real and should win.
+            biased;
+            r = rx => Some(r),
+            _ = gone_signal => None,
+        }
+    };
+    match tokio::time::timeout(timeout, settled).await {
+        Ok(None) => (
+            StatusCode::BAD_GATEWAY,
+            format!("Worker serving {path} went away"),
+        )
+            .into_response(),
+        Ok(Some(Ok(resp))) => {
             let status =
                 StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let mut response = axum::response::Response::builder().status(status);
@@ -796,7 +855,7 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
                 .unwrap()
                 .into_response()
         }
-        Ok(Err(_)) => (
+        Ok(Some(Err(_))) => (
             StatusCode::BAD_GATEWAY,
             "Worker dropped the request".to_string(),
         )
