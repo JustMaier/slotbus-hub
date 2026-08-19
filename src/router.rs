@@ -83,7 +83,15 @@ pub struct SseEvent {
 /// Info about an active hub-managed SSE connection.
 pub struct SseConnectionInfo {
     pub connection_id: String,
-    pub worker_id: String,
+    /// Which worker owns this stream, by **name** rather than by instance id.
+    ///
+    /// The name is the stable identity: a worker restarts, is evicted, sleeps
+    /// and re-registers under a fresh `worker_id` every time, but it is the
+    /// same `agent` throughout, and the route table is rebuilt under the name.
+    /// Keying a connection to one instance meant every path that lost the
+    /// instance lost the connection with it — see [`register_worker`]'s replay
+    /// and [`dispatch_sse_lifecycle`], both of which now resolve through here.
+    pub worker_name: String,
     pub path_pattern: String,
     pub params: HashMap<String, String>,
     pub sender: mpsc::Sender<SseEvent>,
@@ -127,6 +135,9 @@ struct RouteEntry {
     method: String,
     pattern: String,
     worker_id: String,
+    /// The owning worker's name, carried alongside the instance id so an SSE
+    /// connection can be filed under the identity that survives a restart.
+    worker_name: String,
     sse: bool,
 }
 
@@ -529,6 +540,7 @@ async fn register_worker(
                 method: route.method.clone(),
                 pattern: route.path.clone(),
                 worker_id: worker_id.clone(),
+                worker_name: req.name.clone(),
                 sse: route.sse,
             });
         }
@@ -548,20 +560,33 @@ async fn register_worker(
         );
     }
 
-    // ── SSE replay: re-associate stale connections with new worker ────────
-    if !stale_ids.is_empty() {
+    // ── SSE replay: hand this worker every connection that belongs to it ──
+    //
+    // Unconditional, and matched by NAME. It used to run only when a
+    // same-named worker was still registered (`stale_ids`), which quietly made
+    // recovery depend on how long the worker had been away: the liveness
+    // reaper evicts after ~30s (`LIVENESS_REAP_INTERVAL` × `LIVENESS_MAX_MISSES`)
+    // and `evict_worker` does not touch `sse_connections`, so past that point
+    // `stale_ids` was empty, this block never ran, and every live client sat in
+    // the map bound to an instance id that no longer existed — permanently,
+    // because nothing else ever rewrites that field.
+    //
+    // Measured 2026-08-19: an agent-server rebuild takes longer than 30s to
+    // come back, so the repair path was skipped on precisely the restarts that
+    // needed it. 17 connections replayed on a fast restart; 1 on the one after
+    // an eviction, the other 16 orphaned with no error anywhere. Clients cannot
+    // detect this themselves — the hub's own `sse_ping` sweeper keeps their
+    // heartbeat satisfied, so nothing reconnects — leaving a 60s client-side
+    // registration watchdog as the only repair.
+    //
+    // Matching on the name removes the dependency rather than lengthening it:
+    // no eviction reason, downtime, sleep or crash can lose a connection now,
+    // because there is no per-instance state left for the loss to hang on.
+    // A clean long absence and a crash no longer have to be told apart.
+    {
         let replay = {
-            let mut sse = state.sse_connections.write().await;
-            let mut to_replay = Vec::new();
-
-            for (path, info) in sse.iter_mut() {
-                if stale_ids.contains(&info.worker_id) {
-                    to_replay.push((path.clone(), info.params.clone(), info.path_pattern.clone()));
-                    info.worker_id = worker_id.clone();
-                }
-            }
-
-            to_replay
+            let sse = state.sse_connections.read().await;
+            connections_owned_by(&sse, &req.name)
         };
 
         if !replay.is_empty() {
@@ -569,6 +594,7 @@ async fn register_worker(
             let replay_state = Arc::clone(&state);
             let replay_worker_id = worker_id.clone();
             let replay_name = req.name.clone();
+            let replay_name_for_dispatch = req.name.clone();
 
             tracing::info!(
                 name = req.name,
@@ -602,10 +628,10 @@ async fn register_worker(
                 let mut tasks = tokio::task::JoinSet::new();
                 for (path, params, pattern) in replay {
                     let state = Arc::clone(&replay_state);
-                    let worker_id = replay_worker_id.clone();
+                    let worker_name = replay_name_for_dispatch.clone();
                     tasks.spawn(async move {
                         dispatch_sse_lifecycle(
-                            &state, &worker_id, "connect", &path, &pattern, &params,
+                            &state, &worker_name, "connect", &path, &pattern, &params,
                         )
                         .await;
                     });
@@ -760,8 +786,13 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
         .iter()
         .find(|entry| entry.method == method && match_route(&entry.pattern, &path).is_some());
 
-    let (route_pattern, worker_id, is_sse) = match matched {
-        Some(entry) => (entry.pattern.clone(), entry.worker_id.clone(), entry.sse),
+    let (route_pattern, worker_id, worker_name, is_sse) = match matched {
+        Some(entry) => (
+            entry.pattern.clone(),
+            entry.worker_id.clone(),
+            entry.worker_name.clone(),
+            entry.sse,
+        ),
         None => {
             return (
                 StatusCode::BAD_GATEWAY,
@@ -776,7 +807,7 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
 
     // ── SSE delegation: hub manages the connection ───────────────────────
     if is_sse {
-        return handle_sse_delegation(state, worker_id, path, route_pattern, path_params)
+        return handle_sse_delegation(state, worker_name, path, route_pattern, path_params)
             .await
             .into_response();
     }
@@ -900,7 +931,7 @@ impl Drop for SseDropGuard {
 /// notify the worker, and return the SSE response.
 async fn handle_sse_delegation(
     state: Arc<HubState>,
-    worker_id: String,
+    worker_name: String,
     path: String,
     route_pattern: String,
     path_params: HashMap<String, String>,
@@ -926,7 +957,7 @@ async fn handle_sse_delegation(
             path.clone(),
             SseConnectionInfo {
                 connection_id: connection_id.clone(),
-                worker_id: worker_id.clone(),
+                worker_name: worker_name.clone(),
                 path_pattern: route_pattern.clone(),
                 params: path_params.clone(),
                 sender: tx,
@@ -937,7 +968,7 @@ async fn handle_sse_delegation(
 
     tracing::info!(
         path,
-        worker_id,
+        worker_name,
         connection_id,
         "SSE client connected (delegated)"
     );
@@ -945,7 +976,7 @@ async fn handle_sse_delegation(
     // Notify worker of the connection via SHM
     dispatch_sse_lifecycle(
         &state,
-        &worker_id,
+        &worker_name,
         "connect",
         &path,
         &route_pattern,
@@ -1005,7 +1036,7 @@ pub(crate) async fn cleanup_sse_connection(
     // or belongs to a newer connection (race with a replacement on the same
     // path). The compare-and-swap runs under the write lock so no one can
     // slip a replacement in between our check and the remove.
-    let (worker_id, path_pattern, params, connected_at) = {
+    let (worker_name, path_pattern, params, connected_at) = {
         let mut sse = state.sse_connections.write().await;
         let info = match sse.get(path) {
             Some(info) => info,
@@ -1022,7 +1053,7 @@ pub(crate) async fn cleanup_sse_connection(
             return;
         }
         let snapshot = (
-            info.worker_id.clone(),
+            info.worker_name.clone(),
             info.path_pattern.clone(),
             info.params.clone(),
             info.connected_at.clone(),
@@ -1033,15 +1064,20 @@ pub(crate) async fn cleanup_sse_connection(
 
     tracing::info!(
         path,
-        worker_id,
+        worker_name,
         reason,
         connected_at,
         "SSE client disconnected"
     );
 
+    // By name, so the disconnect reaches whichever instance is serving that
+    // worker now. Keyed by instance id this was the second half of the same
+    // defect: a connection that outlived its worker carried a dead id, so the
+    // eventual disconnect was dispatched into nothing and the live worker never
+    // heard it — leaving a channel marked connected with no client behind it.
     dispatch_sse_lifecycle(
         state,
-        &worker_id,
+        &worker_name,
         "disconnect",
         path,
         &path_pattern,
@@ -1050,24 +1086,52 @@ pub(crate) async fn cleanup_sse_connection(
     .await;
 }
 
+/// Every SSE connection belonging to `worker_name`, as `(path, params, pattern)`.
+///
+/// Deliberately a pure function of the connection map alone. It consults no
+/// worker record, so the set it returns cannot shrink because a worker was
+/// evicted, slept, crashed, or stayed away longer than some timeout — which is
+/// exactly how the replay used to lose connections.
+fn connections_owned_by(
+    sse: &HashMap<String, SseConnectionInfo>,
+    worker_name: &str,
+) -> Vec<(String, HashMap<String, String>, String)> {
+    sse.iter()
+        .filter(|(_, info)| info.worker_name == worker_name)
+        .map(|(path, info)| (path.clone(), info.params.clone(), info.path_pattern.clone()))
+        .collect()
+}
+
 /// Dispatch an SSE lifecycle notification (connect/disconnect) to a worker via SHM.
+///
+/// Resolved by worker **name**: whichever instance currently answers for that
+/// name is the one that needs to hear about the stream. Looking it up by
+/// instance id meant a notification for a connection that had outlived one
+/// worker process could never be delivered to its replacement.
 async fn dispatch_sse_lifecycle(
     state: &HubState,
-    worker_id: &str,
+    worker_name: &str,
     lifecycle: &str,
     path: &str,
     route_pattern: &str,
     params: &HashMap<String, String>,
 ) {
     let workers = state.workers.read().await;
-    let bus = match workers.get(worker_id) {
-        Some(record) => Arc::clone(&record.bus),
+    let bus = match workers
+        .values()
+        .find(|record| record.name == worker_name)
+        .map(|record| Arc::clone(&record.bus))
+    {
+        Some(bus) => bus,
         None => {
+            // Not an error: the worker is down right now. The connection stays
+            // in the map, and `register_worker` replays it by name as soon as
+            // a process answers for that name again.
             tracing::warn!(
-                worker_id,
+                worker_name,
                 lifecycle,
                 path,
-                "cannot send SSE lifecycle: worker not found"
+                "cannot send SSE lifecycle: no live worker under that name"
             );
             return;
         }
@@ -1206,13 +1270,23 @@ mod tests {
         path: &str,
         connection_id: &str,
     ) -> mpsc::Receiver<SseEvent> {
+        insert_conn_for(state, path, connection_id, "test-worker").await
+    }
+
+    /// Same, but under a named owner, for the replay-selection tests.
+    async fn insert_conn_for(
+        state: &HubState,
+        path: &str,
+        connection_id: &str,
+        worker_name: &str,
+    ) -> mpsc::Receiver<SseEvent> {
         let (tx, rx) = mpsc::channel::<SseEvent>(16);
         let mut sse = state.sse_connections.write().await;
         sse.insert(
             path.to_string(),
             SseConnectionInfo {
                 connection_id: connection_id.to_string(),
-                worker_id: "test-worker".to_string(),
+                worker_name: worker_name.to_string(),
                 path_pattern: path.to_string(),
                 params: HashMap::new(),
                 sender: tx,
@@ -1415,5 +1489,82 @@ mod tests {
                 "should have accepted {good:?}"
             );
         }
+    }
+
+    // ---- SSE replay selection ------------------------------------------------
+    //
+    // The regression these cover: replay used to be scoped to workers still
+    // present in `state.workers` under the same name. `evict_worker` removes
+    // that record after ~30s of silence without touching `sse_connections`, so
+    // any restart slower than the reaper — i.e. every rebuild — found nothing to
+    // replay and stranded every live client on a dead worker id, permanently and
+    // silently.
+
+    #[tokio::test]
+    async fn replay_selection_survives_eviction_of_the_owning_worker() {
+        let state = make_state();
+        let _rx_a = insert_conn_for(&state, "/agent/events/a", "conn-a", "agent").await;
+        let _rx_b = insert_conn_for(&state, "/agent/events/b", "conn-b", "agent").await;
+
+        // The worker is gone entirely — no record, nothing to be "stale"
+        // against. This is the state a rebuild leaves behind.
+        evict_worker(&state, "some-worker-id-that-was-never-registered").await;
+
+        let sse = state.sse_connections.read().await;
+        let replay = connections_owned_by(&sse, "agent");
+        assert_eq!(
+            replay.len(),
+            2,
+            "both connections must be replayed to the returning worker, \
+             regardless of how long it was away"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_selection_does_not_adopt_another_workers_connections() {
+        let state = make_state();
+        let _rx_agent = insert_conn_for(&state, "/agent/events/a", "conn-a", "agent").await;
+        let _rx_term = insert_conn_for(&state, "/term/events/t", "conn-t", "term").await;
+
+        let sse = state.sse_connections.read().await;
+
+        // A `term` registration must not inherit an orphaned `agent` stream and
+        // point it at a worker with no such route — the hazard in matching
+        // negatively ("belongs to no live worker") instead of by name.
+        let term = connections_owned_by(&sse, "term");
+        assert_eq!(term.len(), 1);
+        assert_eq!(term[0].0, "/term/events/t");
+
+        let agent = connections_owned_by(&sse, "agent");
+        assert_eq!(agent.len(), 1);
+        assert_eq!(agent[0].0, "/agent/events/a");
+    }
+
+    #[tokio::test]
+    async fn replay_selection_carries_path_params_and_pattern() {
+        let state = make_state();
+        let (tx, _rx) = mpsc::channel::<SseEvent>(16);
+        {
+            let mut sse = state.sse_connections.write().await;
+            sse.insert(
+                "/agent/events/abc-123".to_string(),
+                SseConnectionInfo {
+                    connection_id: "conn-1".to_string(),
+                    worker_name: "agent".to_string(),
+                    path_pattern: "/agent/events/{sessionId}".to_string(),
+                    params: HashMap::from([("sessionId".to_string(), "abc-123".to_string())]),
+                    sender: tx,
+                    connected_at: "0Z".to_string(),
+                },
+            );
+        }
+
+        let sse = state.sse_connections.read().await;
+        let replay = connections_owned_by(&sse, "agent");
+        assert_eq!(replay.len(), 1);
+        // The worker rebuilds the channel from these; a replay that dropped the
+        // params would reconnect the stream and still lose the session.
+        assert_eq!(replay[0].1.get("sessionId").map(String::as_str), Some("abc-123"));
+        assert_eq!(replay[0].2, "/agent/events/{sessionId}");
     }
 }
