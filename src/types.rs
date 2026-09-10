@@ -103,3 +103,30 @@ pub struct SseLifecycle {
     /// Extracted path parameters from the SSE route.
     pub params: HashMap<String, String>,
 }
+
+/// The OS-level prefix for every hub SHM region, from `SLOTBUS_PREFIX`.
+///
+/// Region names are `{prefix}-{worker}` (slotbus `SlotBusConfig::region_name`),
+/// so with a fixed prefix two hubs on one machine fight over `hub-tts` even when
+/// their HTTP ports differ. The second worker to register displaces the first,
+/// which reads as "worker went away" on a route that was working a moment ago.
+/// That made it impossible to smoke-test a packaged build beside a running fleet
+/// — ports were configurable, this was not.
+///
+/// Default `hub`, so nothing changes for an existing deployment, and a binary
+/// built before this existed computes the same names as one built after.
+///
+/// **Both call sites must use this.** The hub creates the region and the worker
+/// opens it by name; if they disagree the worker cannot find it, and the failure
+/// is a silence rather than an error. Read once so a mid-run environment change
+/// cannot make them diverge either.
+pub fn shm_prefix() -> &'static str {
+    static PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| {
+        std::env::var("SLOTBUS_PREFIX")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "hub".to_string())
+    })
+}

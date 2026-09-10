@@ -509,7 +509,7 @@ async fn register_worker(
     // Create SlotBus for this worker
     let config = SlotBusConfig::builder()
         .name(&req.name)
-        .prefix("hub")
+        .prefix(shm_prefix())
         .num_slots(state.config.num_slots)
         .region_size(state.config.region_size)
         .instrumentation(state.config.instrumentation)

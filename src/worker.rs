@@ -409,7 +409,7 @@ async fn run_once<S: Send + Sync + 'static>(
     );
 
     // ── Open SHM region ──────────────────────────────────────────────────
-    let worker_config = SlotBusConfig::builder().name(name).prefix("hub").build();
+    let worker_config = SlotBusConfig::builder().name(name).prefix(shm_prefix()).build();
 
     let transport =
         Arc::new(SlotWorker::open(worker_config).map_err(|e| format!("Failed to open SHM: {e}"))?);
