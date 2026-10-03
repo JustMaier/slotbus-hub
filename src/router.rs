@@ -128,6 +128,117 @@ struct WorkerRecord {
     /// Left alone it waits the full request timeout for a process that is
     /// already gone.
     gone: Arc<tokio::sync::Notify>,
+    /// Proxied requests this hub is waiting on, for explaining slot exhaustion.
+    inflight: Arc<InFlight>,
+}
+
+/// How often one worker's exhaustion snapshot may be logged. A storm produced
+/// 37 failures in one minute; one snapshot per window says the same thing.
+const EXHAUSTION_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Proxied requests in flight to one worker, keyed by route pattern.
+///
+/// The slot table alone says only *that* a worker's slots are claimed, never
+/// by what. On 2026-10-02 the agent worker ran out of 64 slots every ~75s for
+/// days, and the hub logged none of it — the failures reached agents as tool
+/// errors and nowhere else. The cause (one slow route holding a lock that
+/// every other route queued behind) was only found by sampling stacks. This
+/// table is what makes the next one a log line instead.
+///
+/// It tracks the hub's side: an entry leaves when the hub stops waiting. A
+/// request the hub timed out on keeps its slot until the worker answers, so
+/// a timeout is logged separately as the slot outliving its caller.
+#[derive(Default)]
+struct InFlight {
+    next_id: std::sync::atomic::AtomicU64,
+    requests: std::sync::Mutex<HashMap<u64, (std::time::Instant, String)>>,
+    last_report: std::sync::Mutex<Option<std::time::Instant>>,
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+/// Removes its entry from [`InFlight`] when the proxied request ends, on
+/// every path out of the handler.
+struct InFlightGuard {
+    table: Arc<InFlight>,
+    id: u64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.table
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+impl InFlight {
+    fn track(self: &Arc<Self>, label: String) -> InFlightGuard {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, (std::time::Instant::now(), label));
+        InFlightGuard {
+            table: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// `(route, count, oldest age in ms)`, busiest route first.
+    fn by_route(&self) -> Vec<(String, usize, u128)> {
+        let mut grouped: HashMap<String, (usize, u128)> = HashMap::new();
+        for (started, label) in self
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            let entry = grouped.entry(label.clone()).or_default();
+            entry.0 += 1;
+            entry.1 = entry.1.max(started.elapsed().as_millis());
+        }
+        let mut out: Vec<_> = grouped.into_iter().map(|(r, (n, age))| (r, n, age)).collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        out
+    }
+
+    /// One line naming what holds the slots, at most once per
+    /// [`EXHAUSTION_REPORT_INTERVAL`]; failures in between are counted and
+    /// reported with the next line rather than dropped.
+    fn report_dispatch_failure(&self, worker: &str, route: &str, error: &str) {
+        let now = std::time::Instant::now();
+        {
+            let mut last = self.last_report.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|t| now.duration_since(t) < EXHAUSTION_REPORT_INTERVAL) {
+                self.suppressed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            *last = Some(now);
+        }
+        let suppressed = self
+            .suppressed
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        let held = self
+            .by_route()
+            .iter()
+            .take(8)
+            .map(|(r, n, age)| format!("{n}x {r} (oldest {age}ms)"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::warn!(
+            worker,
+            route,
+            error,
+            suppressed_since_last = suppressed,
+            held_by = %held,
+            "SHM dispatch failed"
+        );
+    }
 }
 
 /// Internal route table entry.
@@ -556,6 +667,7 @@ async fn register_worker(
                 routes: req.routes,
                 bus,
                 gone: Arc::new(tokio::sync::Notify::new()),
+                inflight: Arc::new(InFlight::default()),
             },
         );
     }
@@ -740,11 +852,23 @@ async fn slot_diagnostics(State(state): State<Arc<HubState>>) -> impl IntoRespon
             slots.push(serde_json::json!({ "index": index, "state": label }));
         }
 
+        // What the hub is waiting on, by route — the answer to "claimed by
+        // what?" that the slot states alone cannot give.
+        let in_flight: Vec<_> = record
+            .inflight
+            .by_route()
+            .into_iter()
+            .map(|(route, count, oldest_ms)| {
+                serde_json::json!({ "route": route, "count": count, "oldest_ms": oldest_ms })
+            })
+            .collect();
+
         entries.push(serde_json::json!({
             "name": record.name,
             "total_slots": total,
             "free": free,
             "in_use": in_use,
+            "in_flight": in_flight,
             "slots": slots,
         }));
     }
@@ -816,8 +940,12 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
 
     // Look up worker
     let workers = state.workers.read().await;
-    let (bus, gone) = match workers.get(&worker_id) {
-        Some(record) => (Arc::clone(&record.bus), Arc::clone(&record.gone)),
+    let (bus, gone, inflight) = match workers.get(&worker_id) {
+        Some(record) => (
+            Arc::clone(&record.bus),
+            Arc::clone(&record.gone),
+            Arc::clone(&record.inflight),
+        ),
         None => {
             return (
                 StatusCode::BAD_GATEWAY,
@@ -847,13 +975,16 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
     };
 
     // Dispatch via SHM
+    let route_label = format!("{method} {}", meta.route_pattern);
     let req_id = uuid::Uuid::new_v4().to_string();
     let rx = match bus.dispatch(&req_id, &method, &meta, &body_bytes) {
         Ok(rx) => rx,
         Err(e) => {
+            inflight.report_dispatch_failure(&worker_name, &route_label, &e.to_string());
             return (StatusCode::BAD_GATEWAY, format!("SHM dispatch failed: {e}")).into_response();
         }
     };
+    let _tracked = inflight.track(route_label.clone());
 
     // Wait for the response, the worker's departure, or the timeout —
     // whichever comes first.
@@ -891,14 +1022,25 @@ async fn proxy_handler(State(state): State<Arc<HubState>>, request: Request) -> 
             "Worker dropped the request".to_string(),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::GATEWAY_TIMEOUT,
-            format!(
-                "Request to {path} timed out after {}s",
-                state.config.timeout_secs
-            ),
-        )
-            .into_response(),
+        Err(_) => {
+            // The hub stops waiting here; the worker does not. Its slot stays
+            // claimed until the handler returns, so a run of these is a worker
+            // leaking slots in slow motion.
+            tracing::warn!(
+                worker = %worker_name,
+                route = %route_label,
+                timeout_secs = state.config.timeout_secs,
+                "request timed out; its slot stays claimed until the worker answers"
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "Request to {path} timed out after {}s",
+                    state.config.timeout_secs
+                ),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1238,6 +1380,51 @@ pub fn resolve_sse_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table must empty itself on every way out of the proxy, or the
+    /// exhaustion log blames routes that finished long ago.
+    #[test]
+    fn inflight_entries_leave_when_the_guard_drops() {
+        let table = Arc::new(InFlight::default());
+        let a = table.track("GET /agent/online".into());
+        let b = table.track("GET /agent/online".into());
+        let c = table.track("POST /agent/mail/send".into());
+
+        let held = table.by_route();
+        assert_eq!(held[0].0, "GET /agent/online");
+        assert_eq!(held[0].1, 2);
+        assert_eq!(held[1], ("POST /agent/mail/send".into(), 1, held[1].2));
+
+        drop(a);
+        drop(c);
+        assert_eq!(table.by_route().len(), 1);
+        assert_eq!(table.by_route()[0].1, 1);
+        drop(b);
+        assert!(table.by_route().is_empty());
+    }
+
+    /// A storm logs one snapshot per window and COUNTS the rest — a dropped
+    /// failure would understate the storm, which is how this went unseen.
+    #[test]
+    fn dispatch_failures_inside_the_window_are_counted_not_lost() {
+        let table = Arc::new(InFlight::default());
+        table.report_dispatch_failure("agent", "GET /x", "no free slots");
+        for _ in 0..4 {
+            table.report_dispatch_failure("agent", "GET /x", "no free slots");
+        }
+        assert_eq!(
+            table.suppressed.load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
+        // Once the window has passed, the next report carries the count and resets it.
+        *table.last_report.lock().unwrap() =
+            Some(std::time::Instant::now() - EXHAUSTION_REPORT_INTERVAL);
+        table.report_dispatch_failure("agent", "GET /x", "no free slots");
+        assert_eq!(
+            table.suppressed.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
 
     /// Build a minimal HubState with empty worker / route tables. Tests that
     /// only exercise SSE cleanup never hit the SHM dispatch path — when our
