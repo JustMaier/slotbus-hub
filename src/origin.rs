@@ -283,6 +283,15 @@ pub async fn require_trusted_origin(req: Request, next: Next) -> Response {
             if safe_method && matches!(dest, "image" | "audio" | "video") {
                 return next.run(req).await;
             }
+            // A top-level navigation (tapping a hub link in Discord, mail or a
+            // push) is cross-site with no Origin and dest=document. Refusing it
+            // made the phone page unreachable from any link. It is the same
+            // fire-and-forget GET as a media load — the linking page never sees
+            // the response — so it is admitted on the same terms: safe methods
+            // only, under the standing no-mutating-GET rule.
+            if safe_method && dest == "document" {
+                return next.run(req).await;
+            }
             return forbidden("origin-less cross-site fetch", &method, &path);
         }
     }
@@ -589,6 +598,30 @@ mod tests {
             ..Req::get("127.0.0.1:5555")
         }
         .fetch("cross-site", "image")
+        .status()
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cross_site_top_level_navigation_passes() {
+        // Tapping a hub link from another site: no Origin, dest=document.
+        let s = Req::get("127.0.0.1:5555")
+            .fetch("cross-site", "document")
+            .status()
+            .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cross_site_document_dest_post_is_refused() {
+        // A form POST navigation is dest=document too, and carries an Origin
+        // in every current browser; without one it must still be refused.
+        let s = Req {
+            method: Method::POST,
+            ..Req::get("127.0.0.1:5555")
+        }
+        .fetch("cross-site", "document")
         .status()
         .await;
         assert_eq!(s, StatusCode::FORBIDDEN);
