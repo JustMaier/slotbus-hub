@@ -16,9 +16,13 @@
 //! This module closes all of that with three cheap checks that run on every
 //! request, in front of the secret layer, and an explicit CORS allow-list.
 //! The distinguishing fact a browser cannot hide is that it *always* attaches
-//! `Origin` on a cross-origin request (including no-cors and form posts) and
-//! `Sec-Fetch-*` on every fetch. A non-browser client (curl, node/undici, the
-//! worker SDK) sends neither, so the guard is inert for them.
+//! `Origin` on a cross-origin request (including no-cors and form posts) — so
+//! the write path (every state-changing POST) is fully covered. Modern
+//! browsers also attach `Sec-Fetch-*` on every fetch, but that is NOT universal
+//! (Safari < 16.4 and pre-2023 engines omit it), so check C is a best-effort
+//! net for origin-less GETs and is backed by the standing rule that no proxied
+//! GET route may mutate state. A non-browser client (curl, node/undici, the
+//! worker SDK) sends neither header, so the guard is inert for them.
 //!
 //! The three checks:
 //!   A. **Host / DNS-rebinding.** For a loopback peer, the `Host` header must
@@ -57,18 +61,46 @@ const BUILTIN_ALLOWED_ORIGINS: &[&str] = &[
     // (`useHttpsScheme` is unset in the app); macOS/Linux use `tauri://`.
     // Both schemes are listed so flipping `useHttpsScheme` later cannot lock
     // the app out of its own hub.
+    //
+    // NOTE (unverified on macOS): WebKit may send `Origin: null` for a fetch
+    // from a `tauri://` page to an external `http://` origin. If it does, the
+    // Mac app would be refused here and needs a different signal. The primary
+    // (Windows) sends `http://tauri.localhost`, a normal origin, so this is a
+    // Mac-only risk to spot-check on hardware before relying on the app there.
     "http://tauri.localhost",
     "https://tauri.localhost",
     "tauri://localhost",
-    // Vite dev server (DEV_URL / HMR mode). The desktop Svelte fetches the hub
-    // at a hard-coded `http://localhost:3200`, so in dev its page origin is
-    // 1420; worktree views proxy through 1420 and share that origin.
-    "http://localhost:1420",
-    "http://127.0.0.1:1420",
     // The phone, reached through nginx at this name (nginx also adds the
     // shared secret, and arrives as a non-loopback peer).
     "https://hub.justinmaier.com",
 ];
+
+/// Dev-only origins, trusted **only** when `HUB_ALLOW_DEV_ORIGINS` is set.
+///
+/// The Vite dev server binds a fixed port (1420); the desktop Svelte fetches
+/// the hub at a hard-coded `http://localhost:3200`, so in DEV_URL/HMR mode its
+/// page origin is 1420, and worktree views proxy through 1420 and share it.
+/// But 1420 is a *fixed localhost port* — trusting it unconditionally would let
+/// any local process that binds 1420 drive the hub, which is exactly the
+/// "malicious localhost dev server" this guard exists to stop. So it is gated:
+/// the dev-server that launches the hub in HMR mode sets the flag; a plain
+/// (non-dev) hub does not trust 1420 at all.
+const DEV_ALLOWED_ORIGINS: &[&str] = &["http://localhost:1420", "http://127.0.0.1:1420"];
+
+/// Whether `HUB_ALLOW_DEV_ORIGINS` enables [`DEV_ALLOWED_ORIGINS`]. Read once.
+/// Truthy = present and not empty/`0`/`false`.
+fn dev_origins_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("HUB_ALLOW_DEV_ORIGINS")
+            .ok()
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    })
+}
 
 /// Extra origins from `HUB_EXTRA_ORIGINS` (comma-separated), read once.
 ///
@@ -93,6 +125,12 @@ fn extra_origins() -> &'static [String] {
 /// Is `origin` a trusted browser origin? A literal `null` (file://, sandboxed
 /// iframe, `data:` URL) is never trusted.
 pub fn is_allowed_origin(origin: &str) -> bool {
+    is_allowed_origin_inner(origin, dev_origins_enabled())
+}
+
+/// Allow-list decision with the dev-origin gate passed explicitly, so a test
+/// can exercise both states without the process-global `OnceLock`.
+fn is_allowed_origin_inner(origin: &str, dev_enabled: bool) -> bool {
     let origin = origin.trim();
     if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
         return false;
@@ -100,6 +138,10 @@ pub fn is_allowed_origin(origin: &str) -> bool {
     BUILTIN_ALLOWED_ORIGINS
         .iter()
         .any(|o| o.eq_ignore_ascii_case(origin))
+        || (dev_enabled
+            && DEV_ALLOWED_ORIGINS
+                .iter()
+                .any(|o| o.eq_ignore_ascii_case(origin)))
         || extra_origins().iter().any(|o| o.eq_ignore_ascii_case(origin))
 }
 
@@ -109,6 +151,13 @@ fn host_name(host_header: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[') {
         // IPv6 literal: `[addr]:port` or `[addr]`.
         return rest.split_once(']').map(|(a, _)| a).unwrap_or(rest);
+    }
+    // A bare (unbracketed) IPv6 literal has multiple colons and no port; take
+    // it whole rather than mis-splitting `::1` into `::`. Spec requires IPv6
+    // Hosts to be bracketed, so this is belt-and-suspenders for a lenient
+    // client, and still fail-closed (an unparseable result is simply untrusted).
+    if host.matches(':').count() > 1 && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return host;
     }
     // `name:port` / `ipv4:port` / bare — only strip a trailing all-digit port.
     match host.rsplit_once(':') {
@@ -130,8 +179,12 @@ fn is_trusted_loopback_host(host_header: &str) -> bool {
 
 /// Does `origin` (scheme://authority) have the same authority as the request's
 /// own `Host`? Lets a page the hub serves itself (the `/m` bundle on
-/// `localhost:3200`) POST to its own origin. Safe only because, for a loopback
-/// peer, check A has already proven the `Host` is a trusted loopback name.
+/// `localhost:3200`) POST to its own origin. Safe because the browser sets the
+/// `Host` to the connection target (a page cannot forge it to match a
+/// cross-origin), and the two backstops are already in place: for a loopback
+/// peer, check A has proven `Host` is a trusted loopback name; for a
+/// non-loopback peer (check A is skipped), the secret layer still applies —
+/// a non-loopback bind refuses to start without `HUB_SECRET` (main.rs).
 fn origin_matches_host(origin: &str, host: &str) -> bool {
     origin
         .split_once("://")
@@ -213,10 +266,20 @@ pub async fn require_trusted_origin(req: Request, next: Next) -> Response {
     // Gate the last one on Sec-Fetch-Site, allowing media subresources through
     // because the desktop loads avatars as <img> (and audio) with no Origin and
     // Sec-Fetch-Site: cross-site.
+    //
+    // The media exemption is restricted to SAFE methods (GET/HEAD): a real
+    // media subresource is always a GET, and a POST/PUT/DELETE can never
+    // legitimately be dest=image, so this denies a fire-and-forget mutation
+    // dressed up with a media dest. It stays a fire-and-forget READ channel —
+    // the page cannot read the reply (opaque, no ACAO) — which is harmless only
+    // while no proxied GET route mutates state; that is a standing rule for the
+    // hub, not something this layer can enforce alone (every proxied GET route
+    // was a read when this shipped).
     if let Some(site) = sec_fetch_site.as_deref() {
         if site == "cross-site" || site == "same-site" {
             let dest = sec_fetch_dest.as_deref().unwrap_or("");
-            if matches!(dest, "image" | "audio" | "video") {
+            let safe_method = method == Method::GET || method == Method::HEAD;
+            if safe_method && matches!(dest, "image" | "audio" | "video") {
                 return next.run(req).await;
             }
             return forbidden("origin-less cross-site fetch", &method, &path);
@@ -252,6 +315,8 @@ mod tests {
         assert_eq!(host_name("127.0.0.1:3200"), "127.0.0.1");
         assert_eq!(host_name("[::1]:3200"), "::1");
         assert_eq!(host_name("[::1]"), "::1");
+        // Bare (unbracketed) IPv6 is taken whole, not split at the first colon.
+        assert_eq!(host_name("::1"), "::1");
         assert_eq!(host_name("hub.justinmaier.com"), "hub.justinmaier.com");
         // A name that ends in a non-numeric ":suffix" is not a port.
         assert_eq!(host_name("tauri.localhost"), "tauri.localhost");
@@ -272,17 +337,31 @@ mod tests {
 
     #[test]
     fn origin_allow_list() {
-        assert!(is_allowed_origin("http://tauri.localhost"));
-        assert!(is_allowed_origin("https://tauri.localhost"));
-        assert!(is_allowed_origin("tauri://localhost"));
-        assert!(is_allowed_origin("http://localhost:1420"));
-        assert!(is_allowed_origin("https://hub.justinmaier.com"));
+        // `_inner` lets us pin the dev gate; `dev=false` is the default/prod.
+        let allow = |o| is_allowed_origin_inner(o, false);
+        assert!(allow("http://tauri.localhost"));
+        assert!(allow("https://tauri.localhost"));
+        assert!(allow("tauri://localhost"));
+        assert!(allow("https://hub.justinmaier.com"));
         // The probe, and everything else, is not.
-        assert!(!is_allowed_origin("http://localhost:5215"));
-        assert!(!is_allowed_origin("https://evil.example"));
-        assert!(!is_allowed_origin("null"));
-        assert!(!is_allowed_origin("NULL"));
-        assert!(!is_allowed_origin(""));
+        assert!(!allow("http://localhost:5215"));
+        assert!(!allow("https://evil.example"));
+        assert!(!allow("null"));
+        assert!(!allow("NULL"));
+        assert!(!allow(""));
+    }
+
+    #[test]
+    fn dev_origins_are_gated() {
+        // 1420 is a fixed localhost port: trusted only when the dev flag is on,
+        // so a production hub does not trust whatever binds 1420.
+        assert!(!is_allowed_origin_inner("http://localhost:1420", false));
+        assert!(!is_allowed_origin_inner("http://127.0.0.1:1420", false));
+        assert!(is_allowed_origin_inner("http://localhost:1420", true));
+        assert!(is_allowed_origin_inner("http://127.0.0.1:1420", true));
+        // The dev flag never launders a `null` or an arbitrary origin.
+        assert!(!is_allowed_origin_inner("null", true));
+        assert!(!is_allowed_origin_inner("http://localhost:5215", true));
     }
 
     #[test]
@@ -498,6 +577,20 @@ mod tests {
             .status()
             .await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cross_site_media_dest_post_is_refused() {
+        // The media exemption is GET/HEAD only: a POST dressed up with
+        // dest=image must not slip a fire-and-forget mutation through.
+        let s = Req {
+            method: Method::POST,
+            ..Req::get("127.0.0.1:5555")
+        }
+        .fetch("cross-site", "image")
+        .status()
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
