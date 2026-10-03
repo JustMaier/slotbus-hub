@@ -88,16 +88,17 @@ const BUILTIN_ALLOWED_ORIGINS: &[&str] = &[
 const DEV_ALLOWED_ORIGINS: &[&str] = &["http://localhost:1420", "http://127.0.0.1:1420"];
 
 /// Whether `HUB_ALLOW_DEV_ORIGINS` enables [`DEV_ALLOWED_ORIGINS`]. Read once.
-/// Truthy = present and not empty/`0`/`false`.
+///
+/// Enabled only by an explicit affirmative (`1`/`true`/`yes`/`on`,
+/// case-insensitive). An allow-listing flag in security code must not be
+/// enabled by `HUB_ALLOW_DEV_ORIGINS=off` or `=no`, which a "truthy = non-empty"
+/// test would wrongly accept.
 fn dev_origins_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("HUB_ALLOW_DEV_ORIGINS")
             .ok()
-            .map(|v| {
-                let v = v.trim();
-                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-            })
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false)
     })
 }
