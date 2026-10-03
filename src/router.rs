@@ -13,7 +13,6 @@ use axum::{Json, Router};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tower_http::cors::CorsLayer;
 
 use slotbus::types::RequestMeta;
 use slotbus::{SlotBus, SlotBusConfig};
@@ -289,15 +288,27 @@ pub fn build_router(config: HubConfig, auth: crate::auth::AuthState) -> Router {
         .route("/health", get(health))
         .fallback(proxy_handler)
         .with_state(state)
-        // Whole-router layer: wraps every route above *and* the fallback proxy,
-        // which is what carries all worker-registered paths (including SSE).
-        // Sits inside CORS so preflight is answered before auth and so 401s
-        // still carry CORS headers.
+        // Whole-router layers, innermost first. All three wrap every route
+        // above *and* the fallback proxy, which is what carries all
+        // worker-registered paths (including SSE).
+        //
+        //   routes/proxy
+        //     ← require_secret        (X-Hub-Secret for non-loopback peers)
+        //     ← require_trusted_origin (block browser cross-origin / rebinding)
+        //     ← CORS                   (answers OPTIONS, echoes ACAO for allowed)
+        //
+        // The origin guard sits in front of auth so cross-origin browser
+        // traffic is refused before it reaches either auth or dispatch, and
+        // inside CORS so a preflight is answered first and an allowed origin's
+        // 403/401 still carries CORS headers.
         .layer(axum::middleware::from_fn_with_state(
             auth,
             crate::auth::require_secret,
         ))
-        .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn(
+            crate::origin::require_trusted_origin,
+        ))
+        .layer(crate::origin::cors_layer())
 }
 
 // ---- SSE liveness sweeper ----------------------------------------------------

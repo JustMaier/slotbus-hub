@@ -6,6 +6,7 @@
 
 mod auth;
 mod events;
+mod origin;
 mod router;
 
 use std::net::{IpAddr, SocketAddr};
