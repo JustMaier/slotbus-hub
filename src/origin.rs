@@ -193,6 +193,32 @@ fn origin_matches_host(origin: &str, host: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Is `path` exactly a hub page document: `/p/{id}` or `/p/{id}/v{n}`, with
+/// `id` lowercase ASCII alphanumeric and `n` digits? Anything else — an asset
+/// (`/p/{id}/v1/app.js`), a drawer route (`/p/{id}/thread`), a trailing slash,
+/// an encoded or uppercase byte — is not, so the iframe exemption in check C
+/// cannot be stretched to cover it.
+fn is_page_document_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/p/") else {
+        return false;
+    };
+    let (id, ver) = match rest.split_once('/') {
+        Some((id, ver)) => (id, Some(ver)),
+        None => (rest, None),
+    };
+    let id_ok = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    let ver_ok = match ver {
+        None => true,
+        Some(v) => v
+            .strip_prefix('v')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+    };
+    id_ok && ver_ok
+}
+
 fn forbidden(reason: &str, method: &Method, path: &str) -> Response {
     tracing::warn!("origin-guard: refused {method} {path} ({reason})");
     (
@@ -290,6 +316,18 @@ pub async fn require_trusted_origin(req: Request, next: Next) -> Response {
             // the response — so it is admitted on the same terms: safe methods
             // only, under the standing no-mutating-GET rule.
             if safe_method && dest == "document" {
+                return next.run(req).await;
+            }
+            // The desk app frames a hub page (`<iframe src=…/p/{id}>`) from
+            // its own origin (`tauri.localhost`, or Vite's 1420 in dev): a
+            // cross-site navigation with no Origin and dest=iframe. Admitted
+            // ONLY for the page document itself — `/p/{id}` or `/p/{id}/v{n}`
+            // — never for an asset under it, never for any other route. A
+            // framer can no more read the response than a linking page can
+            // (cross-origin frame), and pages carry their own
+            // `frame-ancestors` + `sandbox` CSP, so the browser refuses to
+            // render one inside a parent the page server did not name.
+            if safe_method && dest == "iframe" && is_page_document_path(&path) {
                 return next.run(req).await;
             }
             return forbidden("origin-less cross-site fetch", &method, &path);
@@ -625,6 +663,81 @@ mod tests {
         .status()
         .await;
         assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn page_document_path_shape() {
+        assert!(is_page_document_path("/p/01m4jb4fd1ae95wt6d8m6am26c"));
+        assert!(is_page_document_path("/p/abc/v3"));
+        assert!(is_page_document_path("/p/abc/v12"));
+        // Assets, drawer routes, and anything not exactly the document.
+        assert!(!is_page_document_path("/p/abc/v1/app.js"));
+        assert!(!is_page_document_path("/p/abc/thread"));
+        assert!(!is_page_document_path("/p/abc/state"));
+        assert!(!is_page_document_path("/p/abc/v"));
+        assert!(!is_page_document_path("/p/abc/"));
+        assert!(!is_page_document_path("/p/"));
+        assert!(!is_page_document_path("/p/ABC"));
+        assert!(!is_page_document_path("/p/a%2fb"));
+        assert!(!is_page_document_path("/pages"));
+        assert!(!is_page_document_path("/agent/spawn"));
+        assert!(!is_page_document_path("/x/p/abc"));
+    }
+
+    // A framed page: no Origin, cross-site, dest=iframe. The test router has
+    // no worker for /p/…, so passing the guard reads 502 and refusal 403.
+
+    #[tokio::test]
+    async fn cross_site_iframe_of_page_document_passes() {
+        for p in ["/p/01m4jb4fd1ae95wt6d8m6am26c", "/p/abc/v2"] {
+            let s = Req::get("127.0.0.1:5555")
+                .path(p)
+                .fetch("cross-site", "iframe")
+                .status()
+                .await;
+            assert_eq!(s, StatusCode::BAD_GATEWAY, "{p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_site_iframe_of_anything_else_is_refused() {
+        // The exemption is the page document only: not its assets, not the
+        // drawer routes, not the rest of the hub.
+        for p in ["/p/abc/v1/app.js", "/p/abc/thread", "/pages", "/health", "/agent/online"] {
+            let s = Req::get("127.0.0.1:5555")
+                .path(p)
+                .fetch("cross-site", "iframe")
+                .status()
+                .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_site_iframe_post_is_refused() {
+        let s = Req {
+            method: Method::POST,
+            ..Req::get("127.0.0.1:5555")
+        }
+        .path("/p/abc")
+        .fetch("cross-site", "iframe")
+        .status()
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cross_site_non_iframe_dest_on_page_path_is_refused() {
+        // The path alone admits nothing: a script/fetch load of the page
+        // document is still refused.
+        for d in ["script", "empty", "style"] {
+            let s = Req::get("127.0.0.1:5555")
+                .path("/p/abc")
+                .fetch("cross-site", d)
+                .status()
+                .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{d}");
+        }
     }
 
     #[tokio::test]
