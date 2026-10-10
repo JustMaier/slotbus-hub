@@ -219,6 +219,26 @@ fn is_page_document_path(path: &str) -> bool {
     id_ok && ver_ok
 }
 
+/// The two documents a sibling-subdomain app needs for `<hub-composer>`: the
+/// versioned loader as a script (`/m/assets/hub-composer-v{n}.js`), and the
+/// composer page as a frame (`/m` with a `compose` query). The full fleet UI
+/// at a bare `/m` stays unframeable.
+fn is_composer_embed(path: &str, query: Option<&str>, dest: &str) -> bool {
+    match dest {
+        "script" => path
+            .strip_prefix("/m/assets/hub-composer-v")
+            .and_then(|r| r.strip_suffix(".js"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        "iframe" => {
+            path == "/m"
+                && query.is_some_and(|q| {
+                    q.split('&').any(|kv| kv == "compose" || kv.starts_with("compose="))
+                })
+        }
+        _ => false,
+    }
+}
+
 fn forbidden(reason: &str, method: &Method, path: &str) -> Response {
     tracing::warn!("origin-guard: refused {method} {path} ({reason})");
     (
@@ -328,6 +348,18 @@ pub async fn require_trusted_origin(req: Request, next: Next) -> Response {
             // `frame-ancestors` + `sandbox` CSP, so the browser refuses to
             // render one inside a parent the page server did not name.
             if safe_method && dest == "iframe" && is_page_document_path(&path) {
+                return next.run(req).await;
+            }
+            // The `<hub-composer>` web component (ai-notifications
+            // src/mobile/pwa/hub-composer.js): one of Justin's own apps on a
+            // sibling subdomain loads the loader as a classic <script> and
+            // frames the composer (`/m?compose=…`). SAME-SITE only — the
+            // browser sets that solely for a page on the hub's registrable
+            // domain, which a third-party site cannot claim — and only for
+            // those two exact documents. Neither response is readable by the
+            // framer, and the composer page refuses to draw for an ancestor
+            // outside the domain on its own.
+            if safe_method && site == "same-site" && is_composer_embed(&path, req.uri().query(), dest) {
                 return next.run(req).await;
             }
             return forbidden("origin-less cross-site fetch", &method, &path);
@@ -738,6 +770,57 @@ mod tests {
                 .await;
             assert_eq!(s, StatusCode::FORBIDDEN, "{d}");
         }
+    }
+
+    // <hub-composer>: a sibling subdomain loads the loader and frames the
+    // composer. Same-site only, those two documents only; 502 = passed.
+
+    #[tokio::test]
+    async fn same_site_composer_embed_passes() {
+        for (p, d) in [
+            ("/m/assets/hub-composer-v1.js", "script"),
+            ("/m/assets/hub-composer-v12.js", "script"),
+            ("/m?compose=abc-123", "iframe"),
+            ("/m?compose&page=01m4", "iframe"),
+        ] {
+            let s = Req::get("127.0.0.1:5555").path(p).fetch("same-site", d).status().await;
+            assert_eq!(s, StatusCode::BAD_GATEWAY, "{p} {d}");
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_embed_is_refused_cross_site_or_off_path() {
+        let cases = [
+            // A third-party site: never, whatever the path.
+            ("/m/assets/hub-composer-v1.js", "cross-site", "script"),
+            ("/m?compose=abc", "cross-site", "iframe"),
+            // The full fleet UI stays unframeable, even same-site.
+            ("/m", "same-site", "iframe"),
+            ("/m?composer=1", "same-site", "iframe"),
+            ("/m?x=compose", "same-site", "iframe"),
+            // Any other asset or route, or the wrong dest.
+            ("/m/assets/mobile-abc.js", "same-site", "script"),
+            ("/m/assets/hub-composer-v1.js.map", "same-site", "script"),
+            ("/m/assets/hub-composer-vx.js", "same-site", "script"),
+            ("/m/assets/hub-composer-v1.js", "same-site", "iframe"),
+            ("/m?compose=abc", "same-site", "script"),
+            ("/agent/online", "same-site", "script"),
+            ("/m?compose=abc", "same-site", "empty"),
+        ];
+        for (p, site, d) in cases {
+            let s = Req::get("127.0.0.1:5555").path(p).fetch(site, d).status().await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{p} {site} {d}");
+        }
+    }
+
+    #[tokio::test]
+    async fn same_site_composer_post_is_refused() {
+        let s = Req { method: Method::POST, ..Req::get("127.0.0.1:5555") }
+            .path("/m?compose=abc")
+            .fetch("same-site", "iframe")
+            .status()
+            .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
