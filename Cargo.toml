@@ -27,7 +27,7 @@ readme = "README.md"
 # Resolved from crates.io so a plain `git clone && cargo build` works. To
 # develop against a local slotbus checkout, see "Developing against a local
 # slotbus" in the README — do not reintroduce a `path` here.
-slotbus = "0.2"
+slotbus = "0.2.1"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
